@@ -134,7 +134,7 @@ def run_eval(args):
     from rlbench.action_modes.gripper_action_modes import Discrete
     from rlbench.backend import task as rlbench_task
     from rlbench.backend.utils import task_file_to_task_class
-    from utils.custom_rlbench_env import CustomMultiTaskRLBenchEnv2
+    from astra.env import AstraRLBenchEnv
     from utils.peract_utils_rlbench import CAMERAS, DATA_FOLDER, IMAGE_SIZE
     from utils.rlbench_planning import (
         EndEffectorPoseViaPlanning2,
@@ -180,7 +180,7 @@ def run_eval(args):
     action_mode = MoveArmThenGripper2(
         EndEffectorPoseViaPlanning2(), Discrete()
     )
-    eval_env = CustomMultiTaskRLBenchEnv2(
+    eval_env = AstraRLBenchEnv(
         task_classes=task_classes,
         observation_config=obs_config,
         action_mode=action_mode,
@@ -189,7 +189,9 @@ def run_eval(args):
         headless=args.headless,
         swap_task_every=args.eval_episodes,
         include_lang_goal_in_obs=True,
-        time_in_state=True,
+        # Astra consumes raw Observation fields; omitting the unused time
+        # feature also makes a one-waypoint episode valid (length - 1 == 0).
+        time_in_state=False,
         record_every_n=-1,
     )
     eval_env.eval = True

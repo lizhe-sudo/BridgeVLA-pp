@@ -31,21 +31,6 @@ GHOST_RENDERABLE_FIX = {
 class CustomMultiTaskRLBenchEnv2(CustomMultiTaskRLBenchEnv):
     def __init__(self, *args, **kwargs):
         super(CustomMultiTaskRLBenchEnv2, self).__init__(*args, **kwargs)
-        self._last_raw_observation = None
-
-    @property
-    def last_raw_observation(self):
-        """Most recent live RLBench Observation before wrapper extraction."""
-        return self._last_raw_observation
-
-    def extract_obs(self, obs, t=None, prev_action=None):
-        # Keep the exact object returned by RLBench. The parent extractor
-        # temporarily clears low-level fields such as gripper_pose, then puts
-        # them back; no deepcopy or second sensor capture is needed.
-        self._last_raw_observation = obs
-        return super(CustomMultiTaskRLBenchEnv2, self).extract_obs(
-            obs, t=t, prev_action=prev_action
-        )
 
     def _force_renderable_ghosts(self):
         """Re-enable the renderable flag on the current task's ghost meshes.
@@ -70,7 +55,6 @@ class CustomMultiTaskRLBenchEnv2(CustomMultiTaskRLBenchEnv):
         return n
 
     def reset(self) -> dict:
-        self._last_raw_observation = None
         super().reset()
         if self._force_renderable_ghosts() > 0:
             # Re-render the step-0 observation now that the ghost is visible.
@@ -84,7 +68,6 @@ class CustomMultiTaskRLBenchEnv2(CustomMultiTaskRLBenchEnv):
         return self._previous_obs_dict
 
     def reset_to_demo(self, i, variation_number=-1):
-        self._last_raw_observation = None
         if self._episodes_this_task == self._swap_task_every:
             self._set_new_task()
             self._episodes_this_task = 0
@@ -115,9 +98,3 @@ class CustomMultiTaskRLBenchEnv2(CustomMultiTaskRLBenchEnv):
         self._recorded_images.clear()
 
         return self._previous_obs_dict
-
-    def step(self, act_result):
-        # If planning fails before TaskEnvironment.step returns an Observation,
-        # expose no stale observation from the preceding waypoint.
-        self._last_raw_observation = None
-        return super(CustomMultiTaskRLBenchEnv2, self).step(act_result)
