@@ -37,6 +37,13 @@ def _add_project_paths():
         if os.path.isdir(path) and path not in sys.path:
             sys.path.insert(0, path)
 
+    # This evaluator's ``utils`` package owns custom_rlbench_env. The shared
+    # dependency paths above also contain packages named ``utils``, so keep
+    # this script's directory first for unambiguous Astra-side imports.
+    if SCRIPT_DIR in sys.path:
+        sys.path.remove(SCRIPT_DIR)
+    sys.path.insert(0, SCRIPT_DIR)
+
 
 def _build_parser():
     parser = argparse.ArgumentParser(
@@ -269,8 +276,10 @@ def run_eval(args):
                             "episode": episode, "step": step,
                             "instruction": instruction,
                             "current_eef_pose": current_pose,
+                            "eef_pose_after": None,
                             "policy_output": policy_output,
                             "final_action": final_action,
+                            "planner_ik_status": "not_run",
                             "reward": 0.0, "terminal": True, "success": False,
                             "error": f"{episode_error}: {exc}",
                         }, log_file)
@@ -304,14 +313,26 @@ def run_eval(args):
                             )
                             transition_terminal = True
 
+                    eef_pose_after = (
+                        getattr(raw_obs, "gripper_pose", None)
+                        if raw_obs is not None else None
+                    )
+                    planner_ik_status = (
+                        "failed" if planner_error is not None
+                        else "succeeded" if raw_obs is not None
+                        else "unknown"
+                    )
+
                     _emit({
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "kind": "step", "task": task_name,
                         "episode": episode, "step": step,
                         "instruction": instruction,
                         "current_eef_pose": current_pose,
+                        "eef_pose_after": eef_pose_after,
                         "policy_output": policy_output,
                         "final_action": final_action,
+                        "planner_ik_status": planner_ik_status,
                         "reward": episode_reward,
                         "terminal": transition_terminal,
                         "success": episode_success,
