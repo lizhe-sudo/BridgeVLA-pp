@@ -121,14 +121,6 @@ def _emit(record, log_file=None):
         log_file.flush()
 
 
-def _raw_observation(env):
-    """Read the current underlying RLBench Observation after a waypoint."""
-    task_environment = getattr(env._task, "_task", None)
-    if task_environment is None or not hasattr(task_environment, "get_observation"):
-        raise RuntimeError("RLBench task environment cannot provide get_observation()")
-    return task_environment.get_observation()
-
-
 def run_eval(args):
     _add_project_paths()
 
@@ -226,7 +218,11 @@ def run_eval(args):
                 try:
                     eval_env.reset_to_demo(episode)
                     instruction = eval_env._lang_goal
-                    raw_obs = _raw_observation(eval_env)
+                    raw_obs = eval_env.last_raw_observation
+                    if raw_obs is None:
+                        raise RuntimeError(
+                            "reset_to_demo() did not cache an RLBench Observation"
+                        )
                     policy.reset(instruction)
                 except Exception as exc:
                     episode_error = _exception_category(exc)
@@ -291,16 +287,20 @@ def run_eval(args):
                     if planner_error is not None:
                         episode_error = _exception_category(planner_error)
                         error_text = f"{episode_error}: {planner_error}"
-
-                    # Re-fetch the live Observation after every waypoint so the
-                    # next policy call receives updated RGB and gripper_pose.
-                    try:
-                        raw_obs = _raw_observation(eval_env)
-                    except Exception as exc:
-                        if episode_error is None:
-                            episode_error = _exception_category(exc)
-                        error_text = f"{_exception_category(exc)}: {exc}"
+                        raw_obs = None
                         transition_terminal = True
+                    else:
+                        # The wrapper cached the exact Observation returned by
+                        # TaskEnvironment.step() before extract_obs() processed
+                        # it. Reuse it directly; do not recapture camera images.
+                        raw_obs = eval_env.last_raw_observation
+                        if raw_obs is None:
+                            episode_error = "MissingRawObservationError"
+                            error_text = (
+                                "MissingRawObservationError: RLBench step did not "
+                                "cache its returned Observation"
+                            )
+                            transition_terminal = True
 
                     _emit({
                         "timestamp": datetime.now(timezone.utc).isoformat(),
