@@ -48,8 +48,8 @@ def _add_project_paths():
 def _build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Run the first Astra-compatible RLBench control loop using a mock "
-            "or manually specified absolute EEF action."
+            "Run the Astra-compatible RLBench control loop using a mock, "
+            "manual, or Codex-generated absolute EEF action."
         )
     )
     parser.add_argument("--tasks", nargs="+", default=["all"],
@@ -62,7 +62,7 @@ def _build_parser():
                         help="number of episodes per task (default: 1)")
     parser.add_argument("--episode-length", type=int, default=25,
                         help="maximum policy waypoints per episode")
-    parser.add_argument("--policy", choices=("mock", "manual"), default="mock",
+    parser.add_argument("--policy", choices=("mock", "manual", "codex"), default="mock",
                         help="policy implementation (default: mock)")
     parser.add_argument(
         "--manual-action", type=str, default=None,
@@ -70,6 +70,16 @@ def _build_parser():
     )
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction,
                         default=True, help="run simulator headless (default: true)")
+    parser.add_argument("--codex-model", default="gpt-6-luna",
+                        help="Codex CLI model (default: gpt-6-luna)")
+    parser.add_argument("--codex-reasoning", default="max",
+                        help="Codex model reasoning effort (default: max)")
+    parser.add_argument("--codex-timeout", type=float, default=180.0,
+                        help="Codex CLI timeout in seconds (default: 180)")
+    parser.add_argument(
+        "--codex-work-root", default="/tmp/rlbench_codex_policy",
+        help="directory for per-episode Codex inference artifacts",
+    )
     parser.add_argument("--log-file", default=None,
                         help="optional JSONL file for per-step logs")
     return parser
@@ -133,6 +143,7 @@ def run_eval(args):
 
     import numpy as np
     from astra.action_adapter import AstraActionAdapter
+    from astra.codex_policy import CodexAstraPolicy
     from astra.mock_policy import ManualPolicy, MockPolicy
     from astra.observation_adapter import AstraObservationAdapter
 
@@ -165,6 +176,15 @@ def run_eval(args):
         policy = MockPolicy(manual_action=manual_action)
     elif args.policy == "manual":
         policy = ManualPolicy(manual_action)
+    elif args.policy == "codex":
+        if manual_action is not None:
+            raise ValueError("--manual-action cannot be combined with --policy codex")
+        policy = CodexAstraPolicy(
+            model=args.codex_model,
+            reasoning_effort=args.codex_reasoning,
+            timeout=args.codex_timeout,
+            work_root=args.codex_work_root,
+        )
     else:
         policy = MockPolicy()
 
@@ -279,6 +299,7 @@ def run_eval(args):
                             "eef_pose_after": None,
                             "policy_output": policy_output,
                             "final_action": final_action,
+                            "policy_metadata": getattr(policy, "last_metadata", None),
                             "planner_ik_status": "not_run",
                             "reward": 0.0, "terminal": True, "success": False,
                             "error": f"{episode_error}: {exc}",
@@ -332,6 +353,7 @@ def run_eval(args):
                         "eef_pose_after": eef_pose_after,
                         "policy_output": policy_output,
                         "final_action": final_action,
+                        "policy_metadata": getattr(policy, "last_metadata", None),
                         "planner_ik_status": planner_ik_status,
                         "reward": episode_reward,
                         "terminal": transition_terminal,
