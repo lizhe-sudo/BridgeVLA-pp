@@ -91,6 +91,7 @@ CMakeCache.txt
 *.tmp
 /tmp/
 tmp/
+/outputs/
 scratch/
 
 # ===== Editors / OS =====

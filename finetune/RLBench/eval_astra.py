@@ -82,6 +82,27 @@ def _build_parser():
         default=os.path.join(REPO_ROOT, "tmp", "rlbench_codex_policy"),
         help="directory for per-episode Codex inference artifacts",
     )
+    parser.add_argument(
+        "--output-root",
+        default=os.path.join(REPO_ROOT, "outputs", "rlbench_codex_runs"),
+        help="formal output directory for per-episode artifacts and videos",
+    )
+    parser.add_argument(
+        "--record-video", action=argparse.BooleanOptionalAction, default=True,
+        help="record a fixed third-person episode video (default: true)",
+    )
+    parser.add_argument("--recording-azimuth", type=float, default=225.0,
+                        help="recording camera horizontal azimuth in degrees")
+    parser.add_argument("--recording-elevation", type=float, default=30.0,
+                        help="recording camera elevation in degrees")
+    parser.add_argument("--recording-width", type=int, default=1280,
+                        help="recording camera width in pixels")
+    parser.add_argument("--recording-height", type=int, default=720,
+                        help="recording camera height in pixels")
+    parser.add_argument("--recording-fps", type=int, default=20,
+                        help="output video frame rate")
+    parser.add_argument("--recording-radius", type=float, default=None,
+                        help="fixed camera orbit radius in meters (auto if omitted)")
     parser.add_argument("--log-file", default=None,
                         help="optional JSONL file for per-step logs")
     return parser
@@ -132,6 +153,17 @@ def _exception_category(exc):
     return name or "Error"
 
 
+def _token_counts(policy_metadata):
+    usage = (policy_metadata or {}).get("token_usage") or {}
+    return {
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        "reasoning_tokens": int(usage.get(
+            "reasoning_output_tokens", usage.get("reasoning_tokens", 0)
+        ) or 0),
+    }
+
+
 def _emit(record, log_file=None):
     line = json.dumps(_jsonable(record), ensure_ascii=False, allow_nan=False)
     print(line, flush=True)
@@ -146,8 +178,10 @@ def run_eval(args):
     import numpy as np
     from astra.action_adapter import AstraActionAdapter
     from astra.codex_policy import CodexAstraPolicy
+    from astra.episode_recorder import EpisodeRecorder
     from astra.mock_policy import ManualPolicy, MockPolicy
     from astra.observation_adapter import AstraObservationAdapter
+    from astra.visualization import orientation_error_degrees
 
     # Keep the simulator-dependent imports out of module initialization so
     # --help and the schemas remain usable without an installed RLBench stack.
@@ -170,6 +204,12 @@ def run_eval(args):
         raise ValueError("--episode-length must be positive")
     if args.start_episode < 0:
         raise ValueError("--start-episode must be non-negative")
+    if args.recording_width <= 0 or args.recording_height <= 0:
+        raise ValueError("recording dimensions must be positive")
+    if args.recording_fps <= 0:
+        raise ValueError("--recording-fps must be positive")
+    if args.recording_radius is not None and args.recording_radius <= 0:
+        raise ValueError("--recording-radius must be positive")
 
     manual_action = _parse_manual_action(args.manual_action)
     if args.policy == "manual" and manual_action is None:
@@ -232,6 +272,7 @@ def run_eval(args):
         os.makedirs(os.path.dirname(os.path.abspath(args.log_file)), exist_ok=True)
         log_file = open(args.log_file, "a", encoding="utf-8")
 
+    os.makedirs(args.output_root, exist_ok=True)
     results = []
     eval_env.launch()
     try:
@@ -245,10 +286,30 @@ def run_eval(args):
                 episode_reward = 0.0
                 episode_success = False
                 episode_error = None
+                episode_terminal = False
+                termination = "unknown"
+                total_latency = 0.0
+                total_tokens = {"input_tokens": 0, "output_tokens": 0,
+                                "reasoning_tokens": 0}
+                recorder = EpisodeRecorder(
+                    output_root=args.output_root,
+                    task=task_name,
+                    episode=episode,
+                    model=args.codex_model,
+                    reasoning=args.codex_reasoning,
+                    record_video=args.record_video,
+                    azimuth_deg=args.recording_azimuth,
+                    elevation_deg=args.recording_elevation,
+                    width=args.recording_width,
+                    height=args.recording_height,
+                    fps=args.recording_fps,
+                    radius=args.recording_radius,
+                )
                 eval_env._last_exception = None
                 try:
                     eval_env.reset_to_demo(episode)
                     instruction = eval_env._lang_goal
+                    recorder.set_instruction(instruction)
                     raw_obs = eval_env.last_raw_observation
                     if raw_obs is None:
                         raise RuntimeError(
@@ -257,6 +318,7 @@ def run_eval(args):
                     policy.reset(instruction)
                 except Exception as exc:
                     episode_error = _exception_category(exc)
+                    termination = f"reset_error:{episode_error}"
                     _emit({
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "kind": "episode_error", "task": task_name,
@@ -270,115 +332,234 @@ def run_eval(args):
                         "task": task_name, "episode": episode, "success": False,
                         "reward": 0.0, "steps": 0, "error": episode_error,
                     })
+                    recorder.write_summary({
+                        "success": False, "reward": 0.0, "steps": 0,
+                        "termination": termination,
+                        "error": f"{episode_error}: {exc}",
+                    })
+                    recorder.close()
                     continue
 
-                for step in range(args.episode_length):
-                    policy_output = None
-                    final_action = None
-                    current_pose = None
-                    phase = "observation"
-                    try:
-                        astra_observation = observation_adapter.adapt(
-                            raw_obs, instruction
+                try:
+                    recorder.initialize_camera(eval_env._task._scene)
+                    for step in range(args.episode_length):
+                        policy_output = None
+                        final_action = None
+                        current_pose = None
+                        policy_metadata = None
+                        phase = "observation"
+                        try:
+                            astra_observation = observation_adapter.adapt(
+                                raw_obs, instruction
+                            )
+                            current_pose = list(astra_observation.eef_pose)
+                            if tuple(astra_observation.images) != (
+                                    "front", "left_shoulder", "right_shoulder", "wrist"):
+                                raise RuntimeError(
+                                    "policy input cameras differ from the four configured RGB views"
+                                )
+                            phase = "policy"
+                            policy_output = policy.act(astra_observation)
+                            policy_metadata = getattr(policy, "last_metadata", None)
+                            phase = "action_validation"
+                            final_action = action_adapter.adapt(policy_output)
+                        except Exception as exc:
+                            policy_metadata = getattr(policy, "last_metadata", None)
+                            episode_error = (
+                                "InvalidActionError"
+                                if phase == "action_validation"
+                                else _exception_category(exc)
+                            )
+                            total_latency += float(
+                                (policy_metadata or {}).get("latency_seconds") or 0.0
+                            )
+                            counts = _token_counts(policy_metadata)
+                            for key in total_tokens:
+                                total_tokens[key] += counts[key]
+                            error_text = f"{episode_error}: {exc}"
+                            execution = recorder.record_step_failure(
+                                step, raw_obs, error_text, policy_metadata
+                            )
+                            record = {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "kind": "step", **execution,
+                                "current_eef_pose": current_pose,
+                                "policy_output": policy_output,
+                                "policy_metadata": policy_metadata,
+                                "planner_ik_status": "not_run",
+                            }
+                            _emit(record, log_file)
+                            termination = f"policy_error:{episode_error}"
+                            episode_terminal = True
+                            break
+
+                        policy_metadata = getattr(policy, "last_metadata", None)
+                        total_latency += float(
+                            (policy_metadata or {}).get("latency_seconds") or 0.0
                         )
-                        current_pose = list(astra_observation.eef_pose)
-                        phase = "policy"
-                        policy_output = policy.act(astra_observation)
-                        phase = "action_validation"
-                        final_action = action_adapter.adapt(policy_output)
-                    except Exception as exc:
-                        episode_error = (
-                            "InvalidActionError"
-                            if phase == "action_validation"
-                            else _exception_category(exc)
+                        counts = _token_counts(policy_metadata)
+                        for key in total_tokens:
+                            total_tokens[key] += counts[key]
+                        recorder.begin_step(
+                            step, raw_obs, action=policy_output,
+                            final_action=final_action,
+                            policy_metadata=policy_metadata,
                         )
-                        _emit({
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "kind": "step", "task": task_name,
-                            "episode": episode, "step": step,
+                        eval_env._last_exception = None
+                        transition = None
+                        unexpected_error = None
+                        scene = eval_env._task._scene
+                        try:
+                            with recorder.capture_during_execution(scene):
+                                transition = eval_env.step(ActResult(
+                                    np.asarray(final_action, dtype=np.float64)
+                                ))
+                        except Exception as exc:
+                            unexpected_error = exc
+                        steps += 1
+                        planner_error = getattr(eval_env, "_last_exception", None)
+                        if planner_error is None:
+                            planner_error = unexpected_error
+                        error_text = None
+                        if planner_error is not None:
+                            episode_error = _exception_category(planner_error)
+                            error_text = f"{episode_error}: {planner_error}"
+                            raw_after = None
+                        else:
+                            # Use the exact Observation returned by this step.
+                            raw_after = eval_env.last_raw_observation
+                            if raw_after is None:
+                                episode_error = "MissingRawObservationError"
+                                error_text = (
+                                    "MissingRawObservationError: RLBench step did not "
+                                    "cache its returned Observation"
+                                )
+
+                        episode_reward = (
+                            float(transition.reward) if transition is not None else 0.0
+                        )
+                        episode_success = episode_reward > 99.0
+                        episode_terminal = bool(
+                            transition is None or
+                            (transition.terminal if transition is not None else False) or
+                            step == args.episode_length - 1 or
+                            error_text is not None
+                        )
+                        if error_text is not None:
+                            episode_terminal = True
+
+                        eef_pose_after = (
+                            getattr(raw_after, "gripper_pose", None)
+                            if raw_after is not None else None
+                        )
+                        after_pose = (
+                            np.asarray(eef_pose_after, dtype=np.float64).reshape(-1)
+                            if eef_pose_after is not None else None
+                        )
+                        position_error = None
+                        orientation_error = None
+                        if after_pose is not None and after_pose.shape == (7,):
+                            position_error = float(np.linalg.norm(
+                                after_pose[:3] - np.asarray(final_action[:3])
+                            ))
+                            orientation_error = orientation_error_degrees(
+                                final_action[3:7], after_pose[3:7]
+                            )
+                        planner_returned = bool(
+                            planner_error is None and raw_after is not None
+                        )
+                        target_reached = bool(
+                            position_error is not None and position_error < 0.01
+                        )
+                        execution = {
+                            "task": task_name,
+                            "episode": episode,
+                            "step": step,
                             "instruction": instruction,
+                            "eef_pose_before": current_pose,
+                            "target_position": list(final_action[:3]),
+                            "target_quaternion": list(final_action[3:7]),
+                            "gripper_before": bool(raw_obs.gripper_open),
+                            "gripper_command": int(policy_output.gripper),
+                            "final_9d_action": list(final_action),
+                            "eef_pose_after": eef_pose_after,
+                            "gripper_after": (
+                                bool(raw_after.gripper_open)
+                                if raw_after is not None else None
+                            ),
+                            "reward": episode_reward,
+                            "terminal": episode_terminal,
+                            "success": episode_success,
+                            "policy_latency_seconds": (policy_metadata or {}).get(
+                                "latency_seconds"
+                            ),
+                            "token_usage": (policy_metadata or {}).get("token_usage"),
+                            "tool_call_detected": (policy_metadata or {}).get(
+                                "tool_call_detected"
+                            ),
+                            "planner_returned": planner_returned,
+                            "position_error_m": position_error,
+                            "orientation_error_deg": orientation_error,
+                            "target_reached": target_reached,
+                            "error": error_text,
+                        }
+                        execution = recorder.finish_step(
+                            execution, raw_observation_after=raw_after, scene=scene
+                        )
+                        record = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "kind": "step", **execution,
                             "current_eef_pose": current_pose,
-                            "eef_pose_after": None,
                             "policy_output": policy_output,
                             "final_action": final_action,
-                            "policy_metadata": getattr(policy, "last_metadata", None),
-                            "planner_ik_status": "not_run",
-                            "reward": 0.0, "terminal": True, "success": False,
-                            "error": f"{episode_error}: {exc}",
-                        }, log_file)
-                        break
+                            "policy_metadata": policy_metadata,
+                            # Kept for old log readers. Only planner_returned and
+                            # target_reached describe distinct diagnostics.
+                            "planner_ik_status": (
+                                "returned" if planner_returned else "failed"
+                            ),
+                        }
+                        _emit(record, log_file)
 
-                    transition = eval_env.step(ActResult(
-                        np.asarray(final_action, dtype=np.float64)
-                    ))
-                    steps += 1
-                    episode_reward = float(transition.reward)
-                    episode_success = episode_reward > 99.0
-                    planner_error = getattr(eval_env, "_last_exception", None)
-                    transition_terminal = bool(transition.terminal or
-                                               step == args.episode_length - 1)
-                    error_text = None
-                    if planner_error is not None:
-                        episode_error = _exception_category(planner_error)
-                        error_text = f"{episode_error}: {planner_error}"
-                        raw_obs = None
-                        transition_terminal = True
-                    else:
-                        # The wrapper cached the exact Observation returned by
-                        # TaskEnvironment.step() before extract_obs() processed
-                        # it. Reuse it directly; do not recapture camera images.
-                        raw_obs = eval_env.last_raw_observation
-                        if raw_obs is None:
-                            episode_error = "MissingRawObservationError"
-                            error_text = (
-                                "MissingRawObservationError: RLBench step did not "
-                                "cache its returned Observation"
-                            )
-                            transition_terminal = True
+                        if raw_after is not None:
+                            raw_obs = raw_after
+                        if episode_success:
+                            termination = "task_success"
+                        elif error_text is not None:
+                            termination = f"planner_error:{episode_error}"
+                        elif transition is not None and transition.terminal:
+                            termination = "rlbench_terminal"
+                        elif step == args.episode_length - 1:
+                            termination = "episode_length"
+                        if episode_success or episode_terminal:
+                            break
 
-                    eef_pose_after = (
-                        getattr(raw_obs, "gripper_pose", None)
-                        if raw_obs is not None else None
-                    )
-                    planner_ik_status = (
-                        "failed" if planner_error is not None
-                        else "succeeded" if raw_obs is not None
-                        else "unknown"
-                    )
-
-                    _emit({
+                    task_successes += int(episode_success)
+                    summary = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "kind": "step", "task": task_name,
-                        "episode": episode, "step": step,
+                        "kind": "episode_summary",
+                        "task": task_name,
+                        "episode": episode,
                         "instruction": instruction,
-                        "current_eef_pose": current_pose,
-                        "eef_pose_after": eef_pose_after,
-                        "policy_output": policy_output,
-                        "final_action": final_action,
-                        "policy_metadata": getattr(policy, "last_metadata", None),
-                        "planner_ik_status": planner_ik_status,
                         "reward": episode_reward,
-                        "terminal": transition_terminal,
                         "success": episode_success,
-                        "error": error_text,
-                    }, log_file)
-
-                    if episode_success or transition_terminal:
-                        break
-
-                task_successes += int(episode_success)
-                results.append({
-                    "task": task_name, "episode": episode,
-                    "success": episode_success, "reward": episode_reward,
-                    "steps": steps, "error": episode_error,
-                })
-                _emit({
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "kind": "episode_summary", "task": task_name,
-                    "episode": episode, "instruction": instruction,
-                    "reward": episode_reward, "success": episode_success,
-                    "steps": steps, "error": episode_error,
-                }, log_file)
+                        "steps": steps,
+                        "termination": termination,
+                        "error": episode_error,
+                        "total_latency_seconds": total_latency,
+                        **total_tokens,
+                    }
+                    recorder.finalize_video(summary)
+                    recorder.write_summary(summary)
+                    results.append({
+                        "task": task_name, "episode": episode,
+                        "success": episode_success, "reward": episode_reward,
+                        "steps": steps, "error": episode_error,
+                        "output_dir": str(recorder.run_dir),
+                    })
+                    _emit(summary, log_file)
+                finally:
+                    recorder.close()
 
             _emit({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
