@@ -36,8 +36,8 @@ def _build_parser():
             "manual, or Codex-generated absolute EEF action."
         )
     )
-    parser.add_argument("--tasks", nargs="+", default=list(EVAL_TASKS),
-                        help="task names (default: fixed five-task main suite)")
+    parser.add_argument("--tasks", nargs="+", default=["open_drawer"],
+                        help="task names (default: open_drawer; formal mode still requires the fixed five-task main suite)")
     parser.add_argument("--eval-datafolder", default=None,
                         help="RLBench demonstration dataset root")
     parser.add_argument("--run-mode", choices=("debug", "formal"), default="debug",
@@ -77,11 +77,11 @@ def _build_parser():
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction,
                         default=True, help="run simulator headless (default: true)")
     parser.add_argument("--codex-model", default="gpt-6-luna",
-                        help="Codex CLI model (default: gpt-6-luna)")
+                        help="Codex model (default: gpt-6-luna)")
     parser.add_argument("--codex-reasoning", default="max",
                         help="Codex model reasoning effort (default: max)")
     parser.add_argument("--codex-timeout", type=float, default=180.0,
-                        help="Codex CLI timeout in seconds (default: 180)")
+                        help="Codex App Server turn timeout in seconds (default: 180)")
     parser.add_argument(
         "--codex-work-root",
         default=None,
@@ -95,10 +95,18 @@ def _build_parser():
     )
     parser.add_argument(
         "--record-video", action=argparse.BooleanOptionalAction, default=True,
-        help="record a four-view Luna input video (default: true)",
+        help="record separate four-view high-resolution video (default: true)",
     )
-    parser.add_argument("--recording-view-size", type=int, default=512,
-                        help="square output size of each camera tile")
+    parser.add_argument("--session-mode", choices=("episode",), default="episode",
+                        help="native Codex control thread lifetime (one thread per episode)")
+    parser.add_argument("--motion-prompt-profile",
+                        choices=("adaptive_small_steps",),
+                        default="adaptive_small_steps",
+                        help="prompt-only movement-size guidance")
+    parser.add_argument("--recording-width", type=int, default=1280,
+                        help="native high-resolution width of each recording camera")
+    parser.add_argument("--recording-height", type=int, default=720,
+                        help="native high-resolution height of each recording camera")
     parser.add_argument("--recording-fps", type=int, default=20,
                         help="output video frame rate")
     parser.add_argument("--log-file", default=None,
@@ -211,13 +219,26 @@ def _safe_error_message(exc):
     return f"{detail['error_type']} [{detail['error_code']}]: {detail['error_summary']}"
 
 
+_GIT_QUERY_FAILURES = {}
+
+
 def _git_value(*args):
+    query = "git " + " ".join(str(value) for value in args)
     try:
-        return subprocess.run(
+        result = subprocess.run(
             ["git", "-C", REPO_ROOT, *args], check=True,
             capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        )
+        if not isinstance(result.stdout, str):
+            _GIT_QUERY_FAILURES[query] = "git command returned no text stdout"
+            return None
+        _GIT_QUERY_FAILURES.pop(query, None)
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        from astra.errors import sanitize_diagnostic
+        _GIT_QUERY_FAILURES[query] = sanitize_diagnostic(
+            f"{type(exc).__name__}: {exc}"
+        )["text"]
         return None
 
 
@@ -273,8 +294,8 @@ def run_eval(args):
     validate_run_protocol(args.run_mode, tasks, args.eval_episodes, args.repeats)
     if args.start_episode < 0:
         raise ValueError("--start-episode must be non-negative")
-    if args.recording_view_size <= 0 or args.recording_fps <= 0:
-        raise ValueError("recording view size and fps must be positive")
+    if args.recording_width <= 0 or args.recording_height <= 0 or args.recording_fps <= 0:
+        raise ValueError("recording width, height, and fps must be positive")
     if not math.isfinite(args.codex_timeout) or args.codex_timeout <= 0:
         raise ValueError("--codex-timeout must be positive")
     if (not math.isfinite(args.position_tolerance_m)
@@ -359,20 +380,29 @@ def run_eval(args):
         for episode_id in episode_ids
     ]
     start_status = _git_value("status", "--porcelain=v1")
+    start_head = _git_value("rev-parse", "HEAD")
     manifest_path = os.path.join(run_dir, "run_manifest.json")
     manifest = {
         "evaluation_id": evaluation_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "initializing",
         "experiment_name": "Astra-Direct-RGB",
-        "policy_type": {"codex": "codex_cli", "mock": "mock", "manual": "manual"}[args.policy],
+        "policy_type": {"codex": "codex_app_server", "mock": "mock", "manual": "manual"}[args.policy],
         "requested_model": args.codex_model if args.policy == "codex" else None,
         "resolved_model": None,
         "codex_cli_version": None,
         "reasoning_effort": args.codex_reasoning if args.policy == "codex" else None,
-        "code_head": _git_value("rev-parse", "HEAD"),
-        "workspace_dirty_at_start": bool(start_status),
-        "workspace_status_at_start": start_status.splitlines(),
+        "code_head": start_head,
+        "code_head_evidence": {
+            "status": "unknown" if start_head is None else "known",
+            "error": _GIT_QUERY_FAILURES.get("git rev-parse HEAD"),
+        },
+        "workspace_dirty_at_start": (None if start_status is None else bool(start_status)),
+        "workspace_status_at_start": (None if start_status is None else start_status.splitlines()),
+        "workspace_status_evidence": {
+            "status": "unknown" if start_status is None else "known",
+            "error": _GIT_QUERY_FAILURES.get("git status --porcelain=v1"),
+        },
         "run_mode": args.run_mode,
         "protocol": {
             "budget_protocol": args.budget_protocol,
@@ -389,7 +419,13 @@ def run_eval(args):
             "episode_ids": episode_ids,
             "planned_episode_units": planned_manifest,
             "action_horizon": 1,
-            "history_enabled": False,
+            "history_enabled": args.policy == "codex",
+            "history_mode": "native_episode_session" if args.policy == "codex" else "not_applicable",
+            "application_replays_full_history": False,
+            "session_scope": args.session_mode if args.policy == "codex" else None,
+            "motion_guidance": "prompt_only" if args.policy == "codex" else None,
+            "motion_prompt_profile": args.motion_prompt_profile if args.policy == "codex" else None,
+            "programmatic_motion_limiter_added": False,
             "collision_mode": args.collision_mode,
             "collision_action_space_matches_predictive_baseline": args.collision_mode == "predict",
             "position_tolerance_m": args.position_tolerance_m,
@@ -408,6 +444,10 @@ def run_eval(args):
             "claim": "four RGB views plus robot state direct-pose policy; not information-identical to point-cloud BridgeVLA",
             "camera_order": ["front", "left_shoulder", "right_shoulder", "wrist"],
             "configured_image_size": None,
+            "policy_input_resolution": None,
+            "recording_source_resolution": [args.recording_width, args.recording_height],
+            "recording_output_resolution": [args.recording_width * 2, args.recording_height * 2],
+            "recording_fps": args.recording_fps,
             "observed_image_shapes_by_episode": [],
             "video_tile_resolution_is_model_input_resolution": False,
         },
@@ -442,7 +482,9 @@ def run_eval(args):
         "codex_tool_boundary": {
             "sandbox": "read-only",
             "tool_call_detection": "reject output after detecting tool events",
-            "tool_disable_supported_by_inspected_cli": False,
+            "backend": "codex_app_server",
+            "thread_id_and_session_id_source": "thread/start response",
+            "tool_disable_verified": False,
             "strong_tool_isolation_claim": False,
             "automatic_service_retry_added": False,
             "underlying_model_request_count": None,
@@ -489,10 +531,12 @@ def run_eval(args):
             "repeat_id": repeat_id,
             "task": task_name,
             "episode_id": episode_id,
+            "waypoint_budget": budgets[task_name],
         }
 
     results = []
     active_recorder = None
+    active_policy = None
     try:
         try:
             sim_paths = _add_project_paths(args.allow_shared_sim_stack)
@@ -575,6 +619,7 @@ def run_eval(args):
             "reward_success_semantics": "RLBench reward > 99 (verified against eval.py sparse success check)",
         })
         manifest["observation_contract"]["configured_image_size"] = [IMAGE_SIZE, IMAGE_SIZE]
+        manifest["observation_contract"]["policy_input_resolution"] = [IMAGE_SIZE, IMAGE_SIZE]
         data_root = args.eval_datafolder or DATA_FOLDER
         manifest["dataset"]["root"] = os.path.abspath(data_root)
         manifest["dataset"]["version"] = _git_value("-C", data_root, "rev-parse", "HEAD")
@@ -608,6 +653,7 @@ def run_eval(args):
             policy = ManualPolicy(manual_action)
         else:
             policy = MockPolicy()
+        active_policy = policy
 
         manifest["requested_model"] = args.codex_model if args.policy == "codex" else None
         manifest["reasoning_effort"] = args.codex_reasoning if args.policy == "codex" else None
@@ -667,6 +713,11 @@ def run_eval(args):
                         metadata_mismatch_count = 0
                         latest_resolved_model = None
                         latest_cli_version = None
+                        app_server_turns = 0
+                        app_server_requests = 0
+                        app_server_sessions_created = 0
+                        latest_thread_id = None
+                        latest_session_id = None
                         recorder = EpisodeRecorder(
                             output_root=output_dir,
                             task=task_name,
@@ -674,7 +725,8 @@ def run_eval(args):
                             model=args.codex_model if args.policy == "codex" else "not_applicable",
                             reasoning=args.codex_reasoning if args.policy == "codex" else "not_applicable",
                             record_video=args.record_video,
-                            view_size=args.recording_view_size,
+                            recording_width=args.recording_width,
+                            recording_height=args.recording_height,
                             fps=args.recording_fps,
                             policy_type=manifest["policy_type"],
                             collision_mode=args.collision_mode,
@@ -687,7 +739,17 @@ def run_eval(args):
                                 "budget_protocol": args.budget_protocol,
                                 "waypoint_budget": budgets[task_name],
                                 "action_horizon": 1,
-                                "history_enabled": False,
+                                "history_enabled": args.policy == "codex",
+                                "history_mode": "native_episode_session" if args.policy == "codex" else "not_applicable",
+                                "application_replays_full_history": False,
+                                "session_scope": args.session_mode if args.policy == "codex" else None,
+                                "motion_guidance": "prompt_only" if args.policy == "codex" else None,
+                                "motion_prompt_profile": args.motion_prompt_profile if args.policy == "codex" else None,
+                                "programmatic_motion_limiter_added": False,
+                                "policy_input_resolution": [IMAGE_SIZE, IMAGE_SIZE],
+                                "recording_source_resolution": [args.recording_width, args.recording_height],
+                                "recording_output_resolution": [args.recording_width * 2, args.recording_height * 2],
+                                "recording_fps": args.recording_fps,
                                 "codex_cli_version_probe_invocation_count": (
                                     policy.codex_cli_version_probe_invocation_count
                                     if args.policy == "codex" else 0
@@ -723,10 +785,10 @@ def run_eval(args):
                                 raise RuntimeError(
                                     "reset_to_demo() did not cache an RLBench Observation"
                                 )
-                            policy.reset(instruction)
                             context = policy_context(repeat_id, task_name, episode_id)
                             if hasattr(policy, "set_evaluation_context"):
                                 policy.set_evaluation_context(**context)
+                            policy.reset(instruction)
                             actual_input_shapes = {
                                 camera: list(np.asarray(getattr(raw_obs, camera + "_rgb")).shape[:2])
                                 for camera in CAMERAS
@@ -776,6 +838,11 @@ def run_eval(args):
                                         metadata_mismatch_count += 1
                                     if policy_metadata is not None:
                                         cli_calls += int(policy_metadata.get("cli_invocation_count", 0) or 0)
+                                        app_server_turns += int(policy_metadata.get("turn_id") is not None)
+                                        app_server_requests += int(policy_metadata.get("app_server_request_count", 0) or 0)
+                                        app_server_sessions_created += int(policy_metadata.get("app_server_session_create_count", 0) or 0)
+                                        latest_thread_id = policy_metadata.get("thread_id") or latest_thread_id
+                                        latest_session_id = policy_metadata.get("control_session_id") or latest_session_id
                                         cli_time += float(policy_metadata.get("latency_seconds") or 0.0)
                                         token_observations.append(_token_counts(policy_metadata))
                                         latest_resolved_model = policy_metadata.get("resolved_model") or latest_resolved_model
@@ -803,6 +870,11 @@ def run_eval(args):
                                             metadata_mismatch_count += 1
                                         if policy_metadata is not None:
                                             cli_calls += int(policy_metadata.get("cli_invocation_count", 0) or 0)
+                                            app_server_turns += int(policy_metadata.get("turn_id") is not None)
+                                            app_server_requests += int(policy_metadata.get("app_server_request_count", 0) or 0)
+                                            app_server_sessions_created += int(policy_metadata.get("app_server_session_create_count", 0) or 0)
+                                            latest_thread_id = policy_metadata.get("thread_id") or latest_thread_id
+                                            latest_session_id = policy_metadata.get("control_session_id") or latest_session_id
                                             cli_time += float(policy_metadata.get("latency_seconds") or 0.0)
                                             token_observations.append(_token_counts(policy_metadata))
                                             latest_resolved_model = policy_metadata.get("resolved_model") or latest_resolved_model
@@ -914,6 +986,11 @@ def run_eval(args):
                                     "repeat_id": repeat_id,
                                     "episode_id": episode_id,
                                     "step_id": step_id,
+                                    "observation_id": (policy_metadata or {}).get("observation_id"),
+                                    "action_id": (policy_metadata or {}).get("action_id"),
+                                    "control_session_id": (policy_metadata or {}).get("control_session_id"),
+                                    "thread_id": (policy_metadata or {}).get("thread_id"),
+                                    "turn_id": (policy_metadata or {}).get("turn_id"),
                                     "instruction": instruction,
                                     "eef_pose_before": current_pose,
                                     "actual_eef_pose": after_pose_value,
@@ -954,6 +1031,11 @@ def run_eval(args):
                                     "position_tolerance_m": args.position_tolerance_m,
                                     "orientation_tolerance_deg": args.orientation_tolerance_deg,
                                     "planner_returned": planner_returned,
+                                    "environment_step_returned": transition is not None,
+                                    "error_category": {
+                                        "class": error_class,
+                                        "reason": error_reason,
+                                    },
                                     "error": error_message,
                                     "error_class": error_class,
                                     "error_reason": error_reason,
@@ -961,6 +1043,21 @@ def run_eval(args):
                                 execution = recorder.finish_step(
                                     execution, raw_observation_after=raw_after, scene=scene
                                 )
+                                if (args.policy == "codex"
+                                        and hasattr(policy, "record_execution_feedback")
+                                        and (policy_metadata or {}).get("action_id")):
+                                    from astra.execution_feedback import build_execution_feedback
+                                    observation_id_after = (
+                                        policy.observation_id_for_step(step_id + 1)
+                                        if raw_after is not None else None
+                                    )
+                                    feedback = build_execution_feedback(
+                                        execution,
+                                        action_id=policy_metadata["action_id"],
+                                        observation_id_before=policy_metadata.get("observation_id"),
+                                        observation_id_after=observation_id_after,
+                                    )
+                                    policy.record_execution_feedback(feedback)
                                 emit({
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "kind": "step", **execution,
@@ -984,6 +1081,9 @@ def run_eval(args):
                                 error_class = "policy_failure"
                                 error_reason = "action_budget_exhausted"
                                 termination = "waypoint_budget_exhausted"
+
+                        if args.policy == "codex" and hasattr(policy, "end_episode"):
+                            policy.end_episode(termination)
 
                         if error_class in ("infrastructure_error", "unknown"):
                             manifest["status"] = "incomplete"
@@ -1020,12 +1120,18 @@ def run_eval(args):
                             "waypoint_budget": budgets[task_name],
                             "policy_decision_count": policy_decisions,
                             "cli_invocation_count": cli_calls if args.policy == "codex" else 0,
+                            "app_server_session_create_count": app_server_sessions_created if args.policy == "codex" else 0,
+                            "app_server_turn_count": app_server_turns if args.policy == "codex" else 0,
+                            "app_server_request_count": app_server_requests if args.policy == "codex" else 0,
+                            "control_session_id": latest_session_id,
+                            "thread_id": latest_thread_id,
                             "underlying_model_request_count": None,
                             "environment_action_attempt_count": env_action_attempts,
                             "simulation_step_count": recorder.simulation_step_count,
                             "simulation_time_seconds": recorder.simulation_time_seconds,
                             "policy_time_seconds": policy_time,
-                            "cli_time_seconds": cli_time if args.policy == "codex" else None,
+                            "cli_time_seconds": None,
+                            "app_server_turn_time_seconds": cli_time if args.policy == "codex" else None,
                             "action_execution_time_seconds": action_execution_time,
                             "episode_wall_clock_seconds": time.monotonic() - episode_wall_start,
                             "token_usage": token_totals if cli_calls else None,
@@ -1055,7 +1161,17 @@ def run_eval(args):
                             ),
                             "reasoning_effort": args.codex_reasoning if args.policy == "codex" else None,
                             "collision_mode": args.collision_mode,
-                            "history_enabled": False,
+                            "history_enabled": args.policy == "codex",
+                            "history_mode": "native_episode_session" if args.policy == "codex" else "not_applicable",
+                            "application_replays_full_history": False,
+                            "session_scope": args.session_mode if args.policy == "codex" else None,
+                            "motion_guidance": "prompt_only" if args.policy == "codex" else None,
+                            "motion_prompt_profile": args.motion_prompt_profile if args.policy == "codex" else None,
+                            "programmatic_motion_limiter_added": False,
+                            "policy_input_resolution": [IMAGE_SIZE, IMAGE_SIZE],
+                            "recording_source_resolution": [args.recording_width, args.recording_height],
+                            "recording_output_resolution": [args.recording_width * 2, args.recording_height * 2],
+                            "recording_fps": args.recording_fps,
                             "image_shapes_hw": actual_input_shapes,
                         }
                         # The episode summary is authoritative; save the result and
@@ -1195,6 +1311,11 @@ def run_eval(args):
             ) from summary_error
         raise
     finally:
+        if active_policy is not None and hasattr(active_policy, "close"):
+            try:
+                active_policy.close()
+            except Exception:
+                pass
         if active_recorder is not None:
             try:
                 active_recorder.close()

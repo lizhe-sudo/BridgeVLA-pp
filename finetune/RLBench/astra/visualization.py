@@ -164,13 +164,17 @@ def render_policy_grid(rgb_views, cameras, phase, step_index,
     names = ("front", "left_shoulder", "right_shoulder", "wrist")
     if tuple(rgb_views) != names or tuple(cameras) != names:
         raise ValueError("video views must match the four ordered policy cameras")
-    tile_size = cameras["front"].width
-    frame = Image.new("RGB", (tile_size * 2, tile_size * 2), PANEL)
+    tile_width = cameras["front"].width
+    tile_height = cameras["front"].height
+    if any((camera.width, camera.height) != (tile_width, tile_height)
+           for camera in cameras.values()):
+        raise ValueError("recording camera tiles must share one resolution")
+    frame = Image.new("RGB", (tile_width * 2, tile_height * 2), PANEL)
     placements = {
         "front": (0, 0),
-        "left_shoulder": (tile_size, 0),
-        "right_shoulder": (0, tile_size),
-        "wrist": (tile_size, tile_size),
+        "left_shoulder": (tile_width, 0),
+        "right_shoulder": (0, tile_height),
+        "wrist": (tile_width, tile_height),
     }
     for name in names:
         tile = render_policy_view(

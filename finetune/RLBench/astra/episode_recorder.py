@@ -65,17 +65,20 @@ def _write_json(path, value):
 
 
 class PolicyCameraView:
-    """Video rendering view backed by an existing Luna input sensor."""
+    """Projection helper for a camera sensor and rectangular video tile."""
 
     def __init__(self, name, sensor, display_size):
         self.name = name
         self.sensor = sensor
-        self.display_size = int(display_size)
+        if isinstance(display_size, (tuple, list)):
+            self.width, self.height = map(int, display_size)
+        else:
+            self.width = self.height = int(display_size)
+        self.display_size = (self.width, self.height)
         resolution = np.asarray(sensor.get_resolution(), dtype=np.int64).reshape(-1)
         if resolution.shape != (2,) or np.any(resolution <= 0):
             raise RuntimeError(f"{name} camera has invalid resolution {resolution}")
         self.source_width, self.source_height = map(int, resolution)
-        self.width = self.height = self.display_size
         self._scale = min(
             self.width / self.source_width,
             self.height / self.source_height,
@@ -162,7 +165,7 @@ class PolicyCameraView:
 
 
 class PolicyCameraRig:
-    """Passive capture and projection for the exact four policy input sensors."""
+    """Legacy square policy-camera renderer retained for isolated tests."""
 
     def __init__(self, scene, display_size):
         self.cameras = {}
@@ -195,10 +198,123 @@ class PolicyCameraRig:
                 for name, camera in self.cameras.items()}
 
 
+class RecordingCameraRig:
+    """Separate native 16:9, high-resolution sensors used only for video."""
+
+    def __init__(self, scene, width, height):
+        from pyrep.objects.vision_sensor import VisionSensor
+
+        self.width = int(width)
+        self.height = int(height)
+        self.ratio = self.width / self.height
+        self.sources = {}
+        self.sensors = {}
+        self.cameras = {}
+        self.sensor_attrs = {}
+        self._metadata = {}
+        try:
+            for name in POLICY_CAMERAS:
+                attr = SCENE_CAMERA_ATTRS[name]
+                source = getattr(scene, attr, None)
+                if source is None:
+                    raise RuntimeError(f"RLBench scene is missing policy camera {attr}")
+                source_fov = float(source.get_perspective_angle())
+                source_fov_rad = math.radians(source_fov)
+                # PyRep's get_intrinsic_matrix treats perspective_angle as the
+                # horizontal FOV. Expand it for 16:9 while preserving the
+                # original square camera's vertical FOV.
+                recording_fov = math.degrees(2.0 * math.atan(
+                    math.tan(source_fov_rad / 2.0) * self.ratio
+                ))
+                sensor = VisionSensor.create(
+                    resolution=[self.width, self.height],
+                    explicit_handling=True,
+                    perspective_mode=True,
+                    show_volume_not_detecting=False,
+                    show_volume_detecting=False,
+                    near_clipping_plane=float(source.get_near_clipping_plane()),
+                    far_clipping_plane=float(source.get_far_clipping_plane()),
+                    view_angle=recording_fov,
+                    render_mode=source.get_render_mode(),
+                    sensor_size=[0.001, 0.001, 0.001],
+                    position=source.get_position().tolist(),
+                    orientation=source.get_orientation().tolist(),
+                )
+                self.sources[name] = source
+                self.sensors[name] = sensor
+                self.sensor_attrs[name] = attr
+                self.cameras[name] = PolicyCameraView(
+                    name, sensor, (self.width, self.height)
+                )
+                self._metadata[name] = {
+                    "recording_sensor": "episode_created_vision_sensor",
+                    "policy_sensor": attr,
+                    "policy_input_resolution_xy": list(source.get_resolution()),
+                    "policy_input_fov_horizontal_deg": source_fov,
+                    "recording_source_resolution_xy": list(sensor.get_resolution()),
+                    "recording_output_resolution_xy": [self.width, self.height],
+                    "recording_fov_horizontal_deg": recording_fov,
+                    "recording_fov_vertical_deg": source_fov,
+                    "aspect_ratio_policy": float(
+                        source.get_resolution()[0] / source.get_resolution()[1]
+                    ),
+                    "aspect_ratio_recording": self.ratio,
+                    "aspect_policy": "16:9 horizontal FOV expanded to preserve original vertical FOV",
+                    "pose_dynamic": name == "wrist",
+                }
+        except Exception:
+            self.close()
+            raise
+
+    def _sync_sensor_poses(self):
+        for name in POLICY_CAMERAS:
+            self.sensors[name].set_pose(self.sources[name].get_pose())
+
+    def capture_views(self):
+        self._sync_sensor_poses()
+        images = {}
+        for name in POLICY_CAMERAS:
+            sensor = self.sensors[name]
+            sensor.handle_explicitly()
+            image = sensor.capture_rgb()
+            self.cameras[name].update_projection()
+            tile = self.cameras[name].prepare_rgb(image)
+            if tile.shape != (self.height, self.width, 3):
+                raise RuntimeError(
+                    f"{name} high-resolution capture has invalid shape {tile.shape}"
+                )
+            images[name] = tile
+        return images
+
+    def views_from_observation(self, observation):
+        # Never upscale or reuse the low-resolution policy RGB for a recording.
+        return self.capture_views()
+
+    def metadata(self):
+        return {name: {
+            **self._metadata[name],
+            "recording_position": np.asarray(
+                self.sensors[name].get_position(), dtype=float
+            ).tolist(),
+            "recording_orientation_xyzw": np.asarray(
+                self.sensors[name].get_quaternion(), dtype=float
+            ).tolist(),
+        } for name in POLICY_CAMERAS}
+
+    def close(self):
+        for sensor in list(self.sensors.values()):
+            try:
+                sensor.remove()
+            except Exception:
+                pass
+        self.sensors.clear()
+
+
 class EpisodeRecorder:
     def __init__(self, output_root, task, episode, instruction="",
                  model="gpt-6-luna", reasoning="max", record_video=True,
-                 view_size=512, fps=20, policy_type="mock",
+                 recording_width=1280, recording_height=720, fps=20,
+                 policy_type="mock",
                  collision_mode="fixed0", run_context=None):
         self.output_root = Path(output_root).expanduser().absolute()
         self.task = str(task)
@@ -210,11 +326,13 @@ class EpisodeRecorder:
         self.collision_mode = str(collision_mode)
         self.run_context = dict(run_context or {})
         self.record_video = bool(record_video)
-        self.view_size = int(view_size)
+        self.recording_width = int(recording_width)
+        self.recording_height = int(recording_height)
         self.fps = int(fps)
-        if self.view_size <= 0 or self.fps <= 0:
-            raise ValueError("recording view size and fps must be positive")
-        self.video_width = self.video_height = self.view_size * 2
+        if self.recording_width <= 0 or self.recording_height <= 0 or self.fps <= 0:
+            raise ValueError("recording width, height, and fps must be positive")
+        self.video_width = self.recording_width * 2
+        self.video_height = self.recording_height * 2
         self.run_id = self._new_run_id()
         self.run_dir = self.output_root / self.run_id
         self.steps_dir = self.run_dir / "steps"
@@ -236,6 +354,7 @@ class EpisodeRecorder:
         self._frame_index = 0
         self._video_duration = 0.0
         self._next_video_time = 0.0
+        self._frame_timeline = []
         self.simulation_step_count = 0
         self.simulation_time_seconds = 0.0
         self.recording_error = None
@@ -254,7 +373,7 @@ class EpisodeRecorder:
             "model": self.model,
             "experiment_name": "Astra-Direct-RGB",
             "policy_type": self.policy_type,
-            "requested_model": self.model if self.policy_type == "codex_cli" else None,
+            "requested_model": self.model if self.policy_type == "codex_app_server" else None,
             "resolved_model": None,
             "codex_cli_version": None,
             "reasoning_effort": self.reasoning,
@@ -264,14 +383,15 @@ class EpisodeRecorder:
             ),
             **self.run_context,
             "policy_input_cameras": list(POLICY_CAMERAS),
-            "recording_views_match_policy_inputs": True,
+            "recording_views_match_policy_inputs": False,
             "video_composite_passed_to_policy": False,
             "visualization_markers_in_policy_rgb": False,
             "record_video": self.record_video,
             "recording_views": None,
             "recording_view_order": list(POLICY_CAMERAS),
             "recording_layout": "2x2",
-            "recording_view_size": self.view_size,
+            "recording_source_resolution": [self.recording_width, self.recording_height],
+            "recording_output_resolution": [self.video_width, self.video_height],
             "recording_fps": self.fps,
             "video_resolution": [self.video_width, self.video_height],
             "steps": 0,
@@ -304,6 +424,11 @@ class EpisodeRecorder:
             self._initialize_camera(scene, raw_observation)
         except Exception as exc:
             self._set_recording_error(exc)
+            if self._camera_rig is not None:
+                try:
+                    self._camera_rig.close()
+                except Exception:
+                    pass
             self._camera_rig = None
 
     def _set_recording_error(self, exc):
@@ -316,7 +441,9 @@ class EpisodeRecorder:
         return message
 
     def _initialize_camera(self, scene, raw_observation=None):
-        self._camera_rig = PolicyCameraRig(scene, self.view_size)
+        self._camera_rig = RecordingCameraRig(
+            scene, self.recording_width, self.recording_height
+        )
         self._run_meta["recording_views"] = self._camera_rig.metadata()
         try:
             _write_json(self.run_dir / "run_meta.json", self._run_meta)
@@ -337,8 +464,12 @@ class EpisodeRecorder:
             panel={"task": self.task, "instruction": self.instruction},
         )
         ready_path = self._save_video_frame(ready)
-        self._video_frame_paths.extend([ready_path] * (2 * self.fps))
-        self._video_duration += 2.0
+        self._register_display_frame(
+            ready_path, step=0, phase="READY",
+            simulation_time=self.simulation_time_seconds,
+            repeat_count=2 * self.fps,
+        )
+        self._next_video_time = 1.0 / self.fps
         self.recording_status = "recording"
 
     def set_instruction(self, instruction):
@@ -386,7 +517,7 @@ class EpisodeRecorder:
     def _save_policy_artifacts(self, step_dir, policy_metadata):
         codex_dir = step_dir
         metadata = policy_metadata if isinstance(policy_metadata, dict) else {}
-        if self.policy_type != "codex_cli":
+        if self.policy_type != "codex_app_server":
             _write_json(codex_dir / "policy_metadata.json", {
                 "policy_type": self.policy_type,
                 "requested_model": None,
@@ -474,19 +605,55 @@ class EpisodeRecorder:
         )
         return path
 
-    def _add_video_frame(self, rgb, sim_time=None):
-        path = self._save_video_frame(rgb)
-        if sim_time is None:
+    def _register_display_frame(self, path, step, phase, simulation_time,
+                                repeat_count=1, scheduled_time=None):
+        source_frame = int(path.stem.split("_")[-1])
+        for _ in range(int(repeat_count)):
+            frame_index = len(self._video_frame_paths)
             self._video_frame_paths.append(path)
             self._video_duration += 1.0 / self.fps
+            row = {
+                "frame_index": frame_index,
+                "display_time_seconds": frame_index / self.fps,
+                "source_frame_index": source_frame,
+                "step_id": step,
+                "phase": phase,
+                "simulation_time_seconds": simulation_time,
+                "scheduled_simulation_time_seconds": scheduled_time,
+                "repeated_display_frame": int(repeat_count) > 1,
+            }
+            self._frame_timeline.append(row)
+            try:
+                with (self.video_dir / "frame_timeline.jsonl").open(
+                        "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    stream.flush()
+            except Exception as exc:
+                self._set_recording_error(exc)
+
+    def _video_sample_due(self, sim_time):
+        if self._next_video_time <= 0.0:
+            self._next_video_time = 1.0 / self.fps
+        return sim_time + 1e-9 >= self._next_video_time
+
+    def _add_video_frame(self, rgb, sim_time=None, step=None, phase="EXECUTION"):
+        path = self._save_video_frame(rgb)
+        if sim_time is None:
+            self._register_display_frame(
+                path, step=step, phase=phase,
+                simulation_time=self.simulation_time_seconds,
+            )
             return
         frame_interval = 1.0 / self.fps
         if self._next_video_time <= 0.0:
             self._next_video_time = frame_interval
         while sim_time + 1e-9 >= self._next_video_time:
-            self._video_frame_paths.append(path)
+            self._register_display_frame(
+                path, step=step, phase=phase,
+                simulation_time=sim_time,
+                scheduled_time=self._next_video_time,
+            )
             self._next_video_time += frame_interval
-            self._video_duration += frame_interval
 
     def _render(self, rgb_views, phase, step_index, current_xyz=None,
                 target_xyz=None, actual_xyz=None, panel=None, failure=None):
@@ -551,8 +718,11 @@ class EpisodeRecorder:
                     step_dir / "recording" / "before.png"
                 )
                 before_video_path = self._save_video_frame(view)
-                self._video_frame_paths.extend([before_video_path] * self.fps)
-                self._video_duration += 1.0
+                self._register_display_frame(
+                    before_video_path, step=int(step), phase="BEFORE EXECUTION",
+                    simulation_time=self.simulation_time_seconds,
+                    repeat_count=self.fps,
+                )
             except Exception as exc:
                 self._set_recording_error(exc)
         return self._last_step
@@ -569,8 +739,9 @@ class EpisodeRecorder:
             sim_dt = float(scene.pyrep.get_simulation_timestep())
         except Exception:
             sim_dt = 1.0 / self.fps
-        sim_time = 0.0
-        self._next_video_time = 1.0 / self.fps
+        sim_time = self.simulation_time_seconds
+        if self._next_video_time <= 0.0:
+            self._next_video_time = 1.0 / self.fps
 
         def observed_step():
             nonlocal sim_time
@@ -578,7 +749,7 @@ class EpisodeRecorder:
             sim_time += sim_dt
             self.simulation_step_count += 1
             self.simulation_time_seconds += sim_dt
-            if self._camera_rig is not None:
+            if self._camera_rig is not None and self._video_sample_due(sim_time):
                 try:
                     rgb = self._camera_rig.capture_views()
                     actual_xyz = scene.robot.arm.get_tip().get_position()
@@ -597,7 +768,10 @@ class EpisodeRecorder:
                         rgb, "EXECUTION", step["step"], step["current_xyz"],
                         step["target_xyz"], actual_xyz=actual_xyz, panel=panel,
                     )
-                    self._add_video_frame(composed, sim_time=sim_time)
+                    self._add_video_frame(
+                        composed, sim_time=sim_time,
+                        step=step["step"], phase="EXECUTION",
+                    )
                 except Exception as exc:
                     # Never let a rendering failure abort or alter the robot action.
                     if step.get("recording_error") is None:
@@ -657,8 +831,11 @@ class EpisodeRecorder:
                     panel=panel, failure=failure,
                 )
                 after_path = self._save_video_frame(after_video)
-                self._video_frame_paths.extend([after_path] * self.fps)
-                self._video_duration += 1.0
+                self._register_display_frame(
+                    after_path, step=step["step"], phase="AFTER EXECUTION",
+                    simulation_time=self.simulation_time_seconds,
+                    repeat_count=self.fps,
+                )
             except Exception as exc:
                 self._set_recording_error(exc)
 
@@ -813,9 +990,18 @@ class EpisodeRecorder:
                     writer.release()
                 self._run_meta["video_path"] = str(video_path)
                 self._run_meta["video_resolution"] = [self.video_width, self.video_height]
+                self._run_meta["recording_source_resolution"] = [
+                    self.recording_width, self.recording_height
+                ]
+                self._run_meta["recording_output_resolution"] = [
+                    self.video_width, self.video_height
+                ]
                 self._run_meta["video_fps"] = self.fps
                 self._run_meta["video_frame_count"] = len(self._video_frame_paths)
                 self._run_meta["video_duration_seconds"] = len(self._video_frame_paths) / self.fps
+                self._run_meta["frame_timeline_path"] = str(
+                    self.video_dir / "frame_timeline.jsonl"
+                )
                 self.recording_status = (
                     "partial" if self.recording_error is not None else "complete"
                 )
@@ -829,5 +1015,11 @@ class EpisodeRecorder:
         return video_path
 
     def close(self):
+        if self._camera_rig is not None:
+            try:
+                self._camera_rig.close()
+            except Exception:
+                pass
+            self._camera_rig = None
         if not self._log_file.closed:
             self._log_file.close()

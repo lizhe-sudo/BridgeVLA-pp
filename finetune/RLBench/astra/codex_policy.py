@@ -1,4 +1,4 @@
-"""ChatGPT-authenticated Codex CLI policy for Astra RLBench evaluation."""
+"""ChatGPT-authenticated Codex App Server policy for Astra RLBench evaluation."""
 
 import json
 import hashlib
@@ -28,6 +28,7 @@ from .errors import (
     safe_exception_record,
     sanitize_diagnostic,
 )
+from .codex_session import CodexAppServerSession
 from .policy import AstraPolicy
 from .schemas import AstraAction, AstraObservation
 
@@ -39,12 +40,7 @@ class CodexAstraPolicyError(InvalidPolicyOutput):
 
 
 class CodexAstraPolicy(AstraPolicy):
-    """Call Codex CLI once per observation and return one absolute EEF action.
-
-    Each inference is ephemeral, uses an empty temporary working directory,
-    and receives only the four RGB views plus the current robot state. Tool
-    events invalidate the inference before an action can reach the evaluator.
-    """
+    """Run one native Codex App Server thread for each task episode."""
 
     IMAGE_FIELDS = ("front", "left_shoulder", "right_shoulder", "wrist")
     SAFE_ITEM_TYPES = {
@@ -105,6 +101,16 @@ class CodexAstraPolicy(AstraPolicy):
         self._episode_dir = None
         self._evaluation_context = {}
         self._active_metadata = None
+        self._session = None
+        self._control_work_dir = None
+        self._session_manifest_path = None
+        self._control_messages_path = None
+        self._pending_feedback = None
+        self._last_action_binding = None
+        self._feedback_recorded_action_id = None
+        self._session_started_at = None
+        self._session_termination_reason = None
+        self._transient_final_text = None
         self.codex_cli_version_probe_invocation_count = 0
         self.codex_cli_version = self._read_cli_version()
 
@@ -122,17 +128,26 @@ class CodexAstraPolicy(AstraPolicy):
             return None
         return result.stdout.strip() if result.returncode == 0 else None
 
-    def set_evaluation_context(self, evaluation_id, repeat_id, task, episode_id):
+    def set_evaluation_context(self, evaluation_id, repeat_id, task, episode_id,
+                               waypoint_budget=None):
         self._evaluation_context = {
             "evaluation_id": evaluation_id,
             "repeat_id": repeat_id,
             "task": task,
             "episode_id": episode_id,
+            "waypoint_budget": waypoint_budget,
         }
 
     def reset(self, instruction: Optional[str] = None) -> None:
+        if self._session is not None:
+            self.end_episode("episode_reset_without_explicit_close")
         self._instruction = str(instruction or "")
         self._step_index = 0
+        self._pending_feedback = None
+        self._last_action_binding = None
+        self._feedback_recorded_action_id = None
+        self._session = None
+        self._session_termination_reason = None
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         self._episode_dir = self.work_root / f"{run_id}_{uuid.uuid4().hex[:8]}"
         try:
@@ -141,7 +156,129 @@ class CodexAstraPolicy(AstraPolicy):
             raise CoreArtifactWriteError(
                 "failed to create persistent Codex episode directory"
             ) from exc
+        control_root = Path(tempfile.gettempdir()) / "astra_codex_control"
+        try:
+            control_root.mkdir(parents=True, exist_ok=True)
+            self._control_work_dir = Path(tempfile.mkdtemp(
+                prefix="episode_", dir=str(control_root)
+            )).resolve()
+        except OSError as exc:
+            raise CoreArtifactWriteError(
+                "failed to create isolated Codex control working directory"
+            ) from exc
+        self._session_manifest_path = self._episode_dir / "session_manifest.json"
+        self._control_messages_path = self._episode_dir / "control_messages.jsonl"
+        self._session_started_at = None
+        self._write_session_manifest("not_created")
         self.last_metadata = None
+
+    def _session_manifest(self, status):
+        return {
+            "episode_identity": {
+                key: self._evaluation_context.get(key)
+                for key in ("evaluation_id", "repeat_id", "task", "episode_id")
+            },
+            "control_session_id": (
+                self._session.session_id if self._session is not None else None
+            ),
+            "thread_id": self._session.thread_id if self._session is not None else None,
+            "backend": "codex_app_server",
+            "codex_cli_version": self.codex_cli_version,
+            "model_requested": self.model,
+            "resolved_model": (
+                self._session.resolved_model if self._session is not None else None
+            ),
+            "app_server_info": (
+                self._session.app_server_info if self._session is not None else None
+            ),
+            "reasoning_effort": self.reasoning_effort,
+            "created_at": self._session_started_at,
+            "status": status,
+            "session_creation_count": int(
+                self._session is not None and self._session.thread_id is not None
+            ),
+            "session_resume_count": 0,
+            "app_server_rpc_request_count": (
+                self._session.rpc_request_count if self._session is not None else 0
+            ),
+            "control_turn_count": (
+                self._session.turn_count if self._session is not None else 0
+            ),
+            "process_group_exit_confirmed": (
+                self._session.process_group_exit_confirmed
+                if self._session is not None else None
+            ),
+            "native_storage": "Codex App Server managed storage; not copied into application logs",
+            "native_storage_root": str(
+                Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+            ),
+            "working_directory": str(self._control_work_dir) if self._control_work_dir else None,
+            "instruction_sources": (
+                self._session.instruction_sources if self._session is not None else None
+            ),
+            "turns": list(self._session.turn_records) if self._session is not None else [],
+            "context_compression_events": (
+                list(self._session.context_compression_events)
+                if self._session is not None and self._session.context_compression_events
+                else None
+            ),
+            "termination_reason": self._session_termination_reason,
+        }
+
+    def _write_session_manifest(self, status):
+        if self._session_manifest_path is None:
+            return
+        self._write_json(self._session_manifest_path, self._session_manifest(status))
+
+    def _append_control_record(self, record):
+        if self._control_messages_path is None:
+            raise CoreArtifactWriteError("control message log is not initialized")
+        try:
+            with self._control_messages_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False,
+                                        allow_nan=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception as exc:
+            raise CoreArtifactWriteError("failed to persist control message record") from exc
+
+    def _bind_session_turn(self, step_id, action_id, observation_id,
+                           turn_metadata, status):
+        if self._session is None:
+            return
+        turn_id = turn_metadata.get("turn_id")
+        binding = {
+            "step_id": step_id,
+            "observation_id": observation_id,
+            "action_id": action_id,
+            "turn_id": turn_id,
+            "status": status,
+        }
+        if (self._session.turn_records
+                and self._session.turn_records[-1].get("turn_id") == turn_id
+                and turn_id is not None):
+            self._session.turn_records[-1].update(binding)
+        else:
+            self._session.turn_records.append(binding)
+
+    def end_episode(self, termination_reason="episode_finished"):
+        """Release this episode's App Server process and finalize its manifest."""
+        self._session_termination_reason = str(termination_reason)
+        if self._session is not None:
+            self._session.close()
+            status = "failed" if self._session.failed else "closed"
+            self._write_session_manifest(status)
+            self._session = None
+        else:
+            self._write_session_manifest("not_created" if not self._step_index else "failed")
+        if self._control_work_dir is not None:
+            try:
+                self._control_work_dir.rmdir()
+            except OSError:
+                # The App Server may create harmless cwd files; retain the
+                # stable episode directory rather than deleting unknown data.
+                pass
+            self._control_work_dir = None
 
     @staticmethod
     def _schema():
@@ -377,24 +514,6 @@ class CodexAstraPolicy(AstraPolicy):
         self.last_metadata = metadata
         self._write_json(step_dir / "metadata.json", metadata)
 
-    @staticmethod
-    def _build_command(codex, cwd, model, reasoning_effort, schema_path,
-                       output_path, image_paths, prompt):
-        command = [
-            str(codex), "exec", "-C", str(cwd),
-            "--skip-git-repo-check", "--ignore-user-config",
-            "-m", str(model),
-            "-c", f'model_reasoning_effort="{reasoning_effort}"',
-            "-c", 'approval_policy="never"',
-            "--ephemeral", "--sandbox", "read-only", "--color", "never",
-            "--json",
-        ]
-        for camera in CodexAstraPolicy.IMAGE_FIELDS:
-            command.extend(("-i", str(image_paths[camera])))
-        command.extend(("--output-schema", str(schema_path)))
-        command.extend(("--output-last-message", str(output_path), str(prompt)))
-        return command
-
     @classmethod
     def _rejected_output_evidence(cls, raw_path, destination, reason_code):
         """Save allowlisted action fields; never persist arbitrary model text."""
@@ -456,41 +575,174 @@ class CodexAstraPolicy(AstraPolicy):
         cls._write_json(destination, evidence)
         return evidence
 
-    def _make_prompt(self, observation, pose):
+    def _make_prompt(self, observation, pose, step_id):
         instruction = str(observation.instruction or self._instruction)
         gripper_text = "open" if observation.gripper_open else "closed"
-        return (
-            "You control the end-effector of a Franka Panda robot in RLBench.\n\n"
-            f"Task:\n{instruction}\n\n"
-            "The four attached RGB images are, in order:\n"
-            "1. front camera\n"
-            "2. left shoulder camera\n"
-            "3. right shoulder camera\n"
-            "4. wrist camera\n\n"
-            "Current end-effector pose in the RLBench world frame:\n\n"
-            f"position:\n{json.dumps(pose[:3])}\n\n"
-            "quaternion_xyzw:\n"
-            f"{json.dumps(pose[3:7])}\n\n"
-            f"Current gripper:\n{gripper_text}\n\n"
-            "Choose exactly ONE next end-effector waypoint that makes progress "
-            "toward the task.\n\n"
-            "The target position must be an ABSOLUTE position in the RLBench "
-            "world coordinate frame.\n"
-            "Position unit: meters.\n\n"
-            "The pose target refers to the RLBench arm tip reference point "
-            "(the same tip used by the existing pose action mode).\n\n"
-            "The target orientation must be an ABSOLUTE unit quaternion in this "
-            "order:\n\n"
-            "[qx, qy, qz, qw]\n\n"
-            "Gripper command:\n0 = close\n1 = open\n\n"
-            "The existing action mode executes the arm motion first and applies "
-            "the gripper command after the arm stops.\n\n"
-            + self._collision_prompt() + "\n\n"
-            "Use only the task description, attached images, and current robot "
-            "state. Do not use tools, shell commands, filesystem inspection, "
-            "source code, demonstrations, or external information.\n\n"
-            "Return only the structured action required by the output schema."
+        identity = self._evaluation_context
+        remaining = max(0, int(identity.get("waypoint_budget") or 25)
+                        - int(step_id))
+        observation_id = self._observation_id(step_id)
+        camera_lines = "\n".join(
+            f"- {camera}: observation_id={observation_id}"
+            for camera in self.IMAGE_FIELDS
         )
+        current_state = (
+            f"Task instruction: {instruction}\n"
+            f"Current step_id: {int(step_id)}\n"
+            f"Remaining target-action budget: {remaining}\n"
+            f"Current observation_id: {observation_id}\n"
+            f"Measured EEF pose XYZ meters: {json.dumps(pose[:3])}\n"
+            f"Measured EEF quaternion XYZW: {json.dumps(pose[3:7])}\n"
+            f"Measured gripper state: {gripper_text}\n"
+            "The four newly attached RGB images are the CURRENT observation, in this order:\n"
+            f"{camera_lines}\n"
+        )
+        if int(step_id) == 0:
+            return (
+                "You control the end-effector of a Franka Panda robot in RLBench.\n"
+                "This conversation belongs to exactly one task episode.\n\n"
+                "At each turn, output exactly one next absolute end-effector target. "
+                "The evaluator executes that target and then provides the next observation "
+                "and measured execution feedback in this same conversation.\n\n"
+                "Use the CURRENT MEASURED pose as the starting point. A previously "
+                "requested target is not evidence that the robot reached it. When older "
+                "assumptions conflict with new measurements, use the new measurements.\n\n"
+                "Positions are absolute world-frame coordinates in meters. Orientations "
+                "are absolute unit quaternions in XYZW order. The pose refers to the "
+                "RLBench arm-tip reference used by the existing action mode. The arm "
+                "moves first; the gripper command is applied after the arm motion. "
+                "Gripper command: 0 closes, 1 opens.\n"
+                f"{self._collision_prompt()}\n\n"
+                "This is the initial state; there is no action-outcome experience from "
+                "this episode. Prefer a small exploratory or approach movement in a "
+                "direction with visible clearance. Aim for an initial translation of "
+                "approximately 1 cm or less. Prefer to keep the current orientation and "
+                "gripper state during this initial position-to-image exploration. This "
+                "is behavioral guidance, not a guarantee of collision-free motion; do "
+                "not assume that moving upward or along a fixed world axis is always safe.\n\n"
+                "On later turns, use the conversation history together with measured "
+                "execution feedback and newest images to assess how requested movements "
+                "actually affected the robot. When direction, scale, or clearance is "
+                "uncertain, continue with small movements. When recent movements "
+                "reasonably track requests and there is visible clearance, you may choose "
+                "a somewhat larger next movement. Reduce the movement size again near "
+                "the drawer, handle, cabinet surfaces, or narrow contact regions. Avoid "
+                "combining a large translation, a large rotation, and a gripper-state "
+                "change during an uncertain approach.\n\n"
+                "If execution returned but the target was not reached, do not treat that "
+                "as successful motion. Inspect the feedback and current images. Do not "
+                "simply request a larger motion farther in the same direction. A "
+                "discrepancy may suggest obstruction or tracking error, but does not "
+                "prove a collision. The wrist camera moves with the robot; account for "
+                "that motion when comparing images over time.\n\n"
+                "Follow the task instruction to select the correct drawer. Do not assume "
+                "a fixed drawer level, handle coordinate, or pulling axis. Choose all "
+                "exploratory, approach, repositioning, and manipulation targets yourself. "
+                "The evaluator does not insert intermediate movements or recovery skills. "
+                "Every submitted target consumes one action from the remaining budget.\n\n"
+                "Use only the task instruction, images, measured robot state, your own "
+                "prior control messages, and actual execution feedback supplied in this "
+                "conversation. Do not inspect files, source code, demonstrations, or "
+                "external information. Do not use tools.\n\n"
+                f"{current_state}\n"
+                "Return only the structured action required by the output schema."
+            )
+
+        if self._pending_feedback is None:
+            raise ModelServiceError(
+                "a later control turn has no completed-action feedback",
+                error_code="missing_execution_feedback",
+            )
+        return (
+            "Continue the SAME task episode and control conversation.\n\n"
+            f"Current step: {int(step_id)}\n"
+            f"Remaining target-action budget: {remaining}\n\n"
+            "Measured feedback for the immediately previous action:\n"
+            f"{json.dumps(self._pending_feedback, ensure_ascii=False, allow_nan=False)}\n\n"
+            f"{current_state}\n"
+            "Use the actual outcome of the previous action and the newest observation. "
+            "Keep movements small while uncertain, and reduce the motion near contact "
+            "or after an unexpected execution result.\n"
+            "Output exactly one next absolute target in the required schema."
+        )
+
+    def _observation_id(self, step_id):
+        identity = self._evaluation_context
+        return (f"{identity.get('evaluation_id', 'evaluation')}:"
+                f"r{identity.get('repeat_id', 1)}:{identity.get('task', 'task')}:"
+                f"ep{identity.get('episode_id', 0)}:obs{int(step_id):03d}")
+
+    def observation_id_for_step(self, step_id):
+        return self._observation_id(step_id)
+
+    def _action_id(self, step_id):
+        identity = self._evaluation_context
+        return (f"{identity.get('evaluation_id', 'evaluation')}:"
+                f"r{identity.get('repeat_id', 1)}:{identity.get('task', 'task')}:"
+                f"ep{identity.get('episode_id', 0)}:action{int(step_id):03d}")
+
+    def record_execution_feedback(self, feedback):
+        """Persist one completed, allowlisted action result for the next turn."""
+        if not isinstance(feedback, dict):
+            raise ValueError("execution feedback must be a dictionary")
+        expected = self._last_action_binding
+        if expected is None:
+            raise ModelServiceError("there is no pending action to acknowledge",
+                                    error_code="feedback_without_action")
+        if (feedback.get("step_id") != expected["step_id"]
+                or feedback.get("action_id") != expected["action_id"]):
+            raise ModelServiceError("execution feedback does not match the last action",
+                                    error_code="feedback_identity_mismatch")
+        if self._feedback_recorded_action_id == expected["action_id"]:
+            raise ModelServiceError("execution feedback was already recorded for this action",
+                                    error_code="duplicate_execution_feedback")
+        self._pending_feedback = dict(feedback)
+        self._feedback_recorded_action_id = expected["action_id"]
+        self._append_control_record({
+            "event": "execution_feedback",
+            "evaluation_id": self._evaluation_context.get("evaluation_id"),
+            "episode_id": self._evaluation_context.get("episode_id"),
+            "thread_id": self._session.thread_id if self._session else None,
+            "turn_id": expected["turn_id"],
+            **self._pending_feedback,
+        })
+
+    @staticmethod
+    def _safe_action_evidence(raw_text, destination, reason_code):
+        encoded = raw_text.encode("utf-8", errors="replace")
+        evidence = {
+            "status": "rejected", "reason_code": reason_code,
+            "raw_content_saved": False, "byte_length": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "parseable_json": False,
+        }
+        try:
+            parsed = json.loads(raw_text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            evidence["parseable_json"] = True
+            safe_fields = {}
+            for field in ("position", "quaternion", "gripper", "ignore_collisions"):
+                value = parsed.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    safe_fields[field] = value if not isinstance(value, float) or math.isfinite(value) else str(value)
+                elif isinstance(value, list) and len(value) <= 8:
+                    safe_fields[field] = [
+                        item if isinstance(item, (int, float)) and not isinstance(item, bool)
+                        and (not isinstance(item, float) or math.isfinite(item))
+                        else {"type": type(item).__name__}
+                        for item in value
+                    ]
+                elif field in parsed:
+                    safe_fields[field] = {"type": type(value).__name__}
+            evidence["action_fields"] = safe_fields
+            evidence["unexpected_field_count"] = sum(
+                field not in ("position", "quaternion", "gripper", "ignore_collisions")
+                for field in parsed
+            )
+        CodexAstraPolicy._write_json(destination, evidence)
+        return evidence
 
     def _collision_prompt(self):
         if self.collision_mode == "predict":
@@ -505,10 +757,11 @@ class CodexAstraPolicy(AstraPolicy):
         )
 
     def act(self, observation: AstraObservation) -> AstraAction:
+        self._transient_final_text = None
         self.last_metadata = {
             **self._evaluation_context,
             "step_id": self._step_index,
-            "policy_type": "codex_cli",
+            "policy_type": "codex_app_server",
             "requested_model": self.model,
             "resolved_model": None,
             "codex_cli_version": self.codex_cli_version,
@@ -517,6 +770,7 @@ class CodexAstraPolicy(AstraPolicy):
             "collision_mode": self.collision_mode,
             "decision_made": True,
             "cli_invocation_count": 0,
+            "app_server_request_count": 0,
             "underlying_model_request_count": None,
             "latency_seconds": None,
             "token_usage": None,
@@ -529,21 +783,39 @@ class CodexAstraPolicy(AstraPolicy):
             self._active_metadata.update(safe_exception_record(exc))
             self._active_metadata["error"] = self._active_metadata["error_summary"]
             self._active_metadata["raw_structured_output"] = None
-            raw_path = self._active_metadata.get("raw_model_output_path")
             step_dir = self._active_metadata.get("step_dir")
-            if raw_path and step_dir:
-                rejected_path = Path(step_dir) / "rejected_output.json"
+            rejected_path = self._active_metadata.get("rejected_output_path")
+            final_text = self._transient_final_text
+            if step_dir and rejected_path and isinstance(exc, InvalidPolicyOutput):
                 try:
-                    evidence = self._rejected_output_evidence(
-                        raw_path, rejected_path, self._active_metadata["error_code"]
+                    evidence = self._safe_action_evidence(
+                        final_text or "", rejected_path,
+                        self._active_metadata["error_code"],
                     )
                     self._active_metadata["rejected_output_path"] = str(rejected_path)
                     self._active_metadata["rejected_output_evidence"] = evidence
-                finally:
-                    try:
-                        Path(raw_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
+            if self._session is not None and isinstance(
+                    exc, (InvalidPolicyOutput, PolicyToolViolation)):
+                self._session.failed = True
+                self._write_session_manifest("failed")
+            if (step_dir and self._active_metadata.get("turn_id")
+                    and self._active_metadata.get("action_id")):
+                try:
+                    self._append_control_record({
+                        "event": "turn_result",
+                        "thread_id": self._active_metadata.get("thread_id"),
+                        "session_id": self._active_metadata.get("control_session_id"),
+                        "step_id": self._active_metadata.get("step_id"),
+                        "observation_id": self._active_metadata.get("observation_id"),
+                        "action_id": self._active_metadata.get("action_id"),
+                        "turn_id": self._active_metadata.get("turn_id"),
+                        "status": "rejected",
+                        "error_code": self._active_metadata["error_code"],
+                    })
+                except Exception:
+                    pass
             accepted_path = self._active_metadata.get("accepted_action_path")
             if accepted_path:
                 try:
@@ -552,6 +824,7 @@ class CodexAstraPolicy(AstraPolicy):
                     pass
             if step_dir is not None:
                 self._save_metadata(Path(step_dir), self._active_metadata)
+            self._transient_final_text = None
             self.last_metadata = self._active_metadata
             raise
         finally:
@@ -559,7 +832,7 @@ class CodexAstraPolicy(AstraPolicy):
 
     @classmethod
     def _inherited_context_files(cls, working_directory):
-        """Find project instruction/config files visible from the CLI cwd."""
+        """Find project instruction/config files visible from the control cwd."""
         cwd = Path(working_directory).resolve()
         found = []
         for directory in (cwd, *cwd.parents):
@@ -573,291 +846,329 @@ class CodexAstraPolicy(AstraPolicy):
         if self._episode_dir is None:
             self.reset(getattr(observation, "instruction", ""))
 
-        step_dir = self._episode_dir / f"step_{self._step_index:03d}"
+        step_id = self._step_index
         self._step_index += 1
+        step_dir = self._episode_dir / f"step_{step_id:03d}"
         try:
             step_dir.mkdir(parents=True, exist_ok=False)
         except Exception as exc:
             raise CoreArtifactWriteError("failed to create policy step directory") from exc
+
         if self._active_metadata is not None:
-            self._active_metadata["step_id"] = self._step_index - 1
+            self._active_metadata["step_id"] = step_id
             self._active_metadata["step_dir"] = str(step_dir)
 
         pose = self._number_list(
             list(observation.eef_pose), 7, "eef_pose",
             error_type=SimulatorInfrastructureError,
         )
+        observation_id = self._observation_id(step_id)
+        action_id = self._action_id(step_id)
         image_paths = {}
-        for key in self.IMAGE_FIELDS:
-            if key not in observation.images:
-                raise SimulatorInfrastructureError(f"Missing {key} RGB image")
-            image = self._image_as_uint8(observation.images[key], key)
-            image_path = step_dir / f"{key}.png"
+        for camera in self.IMAGE_FIELDS:
+            if camera not in observation.images:
+                raise SimulatorInfrastructureError(f"Missing {camera} RGB image")
+            image = self._image_as_uint8(observation.images[camera], camera)
+            image_path = step_dir / f"{camera}.png"
             try:
                 Image.fromarray(image).save(str(image_path), format="PNG")
             except Exception as exc:
                 raise CoreArtifactWriteError(
-                    f"failed to persist {key} policy input image"
+                    f"failed to persist {camera} policy input image"
                 ) from exc
-            image_paths[key] = str(image_path)
+            image_paths[camera] = str(image_path)
 
-        prompt = self._make_prompt(observation, pose)
+        prompt = self._make_prompt(observation, pose, step_id)
         prompt_path = step_dir / "prompt.txt"
-        try:
-            prompt_path.write_text(prompt + "\n", encoding="utf-8")
-        except Exception as exc:
-            raise CoreArtifactWriteError("failed to persist policy prompt") from exc
         schema_path = step_dir / "action_schema.json"
-        self._write_json(schema_path, self._schema_for_mode(self.collision_mode))
-        raw_output_path = step_dir / "raw_model_output.json"
         accepted_action_path = step_dir / "accepted_action.json"
         rejected_output_path = step_dir / "rejected_output.json"
         events_path = step_dir / "codex_events.jsonl"
-        stderr_path = step_dir / "codex_stderr.log"
+        try:
+            prompt_path.write_text(prompt + "\n", encoding="utf-8")
+            self._write_json(schema_path, self._schema_for_mode(self.collision_mode))
+        except Exception as exc:
+            raise CoreArtifactWriteError("failed to persist control request") from exc
 
         codex = shutil.which("codex")
         if codex is None:
-            raise ModelServiceError(
-                "Codex CLI executable was not found in PATH",
-                error_code="codex_cli_not_found",
-            )
-
+            raise ModelServiceError("Codex executable was not found in PATH",
+                                    error_code="codex_not_found")
+        if self._control_work_dir is None:
+            raise CoreArtifactWriteError("episode control directory was not initialized")
+        cwd_path = Path(self._control_work_dir).resolve()
         metadata = {
             **(self._active_metadata or {}),
             "model": self.model,
             "requested_model": self.model,
-            "resolved_model": None,
-            "policy_type": "codex_cli",
+            "resolved_model": self._session.resolved_model if self._session else None,
+            "policy_type": "codex_app_server",
             "codex_cli_version": self.codex_cli_version,
-            "codex_cli_version_probe_invocation_count": self.codex_cli_version_probe_invocation_count,
+            "app_server_info": self._session.app_server_info if self._session else None,
             "reasoning_effort": self.reasoning_effort,
             "latency_seconds": None,
             "inference_deadline_seconds": self.timeout,
-            "deadline_type": "inference_wall_clock",
-            "codex_return_code": None,
+            "deadline_type": "app_server_turn_wall_clock",
             "raw_structured_output": None,
             "prompt": prompt,
             "prompt_path": str(prompt_path),
             "image_paths": image_paths,
+            "observation_id": observation_id,
+            "action_id": action_id,
+            "thread_id": self._session.thread_id if self._session else None,
+            "control_session_id": self._session.session_id if self._session else None,
             "event_jsonl_path": str(events_path),
             "action_schema_path": str(schema_path),
             "action_json_path": str(accepted_action_path),
             "accepted_action_path": str(accepted_action_path),
-            "raw_model_output_path": str(raw_output_path),
             "rejected_output_path": str(rejected_output_path),
             "token_usage": None,
             "tool_call_detected": False,
             "tool_call_events": [],
-            "codex_working_directory": None,
+            "codex_working_directory": str(cwd_path),
+            "codex_context_files_checked": True,
             "cli_invocation_count": 0,
+            "app_server_request_count": 0,
             "underlying_model_request_count": None,
             "collision_mode": self.collision_mode,
+            "final_message_text": None,
         }
         if self._active_metadata is not None:
             self._active_metadata.update(metadata)
             metadata = self._active_metadata
 
-        # Keep the CLI cwd outside this checkout so repository/ancestor files
-        # cannot silently become project instructions or agent context.
-        cwd_root = Path(tempfile.gettempdir()) / "astra_codex_cwd"
-        cwd_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="rlbench_codex_cwd_", dir=str(cwd_root)
-        ) as cwd:
-            metadata["codex_working_directory"] = cwd
-            cwd_path = Path(cwd).resolve()
-            try:
-                cwd_path.relative_to(REPO_ROOT)
-            except ValueError:
-                pass
-            else:
-                raise ModelServiceError(
-                    "Codex working directory must be outside the repository",
-                    error_code="unsafe_codex_working_directory",
-                )
-            inherited_context = self._inherited_context_files(cwd_path)
-            metadata["codex_context_files_checked"] = True
-            metadata["codex_inherited_context_files"] = inherited_context
-            if inherited_context:
-                raise ModelServiceError(
-                    "Codex working directory inherits project instructions/configuration; "
-                    "refusing to invoke Codex",
-                    error_code="inherited_codex_context",
-                )
-            if os.listdir(cwd):
-                raise ModelServiceError(
-                    "Codex working directory is not empty",
-                    error_code="nonempty_codex_working_directory",
-                )
-            command = self._build_command(
-                codex, cwd, self.model, self.reasoning_effort, schema_path,
-                raw_output_path, image_paths, prompt,
-            )
-            started = time.monotonic()
-            metadata["cli_invocation_count"] = 1
-            metadata["tool_isolation"] = (
-                "read-only sandbox with post-hoc event rejection; no verified CLI flag disables tools"
-            )
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=cwd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self.timeout,
-                    check=False,
-                )
-                event_text = completed.stdout or ""
-                stderr_text = completed.stderr or ""
-                metadata["codex_return_code"] = completed.returncode
-                metadata["codex_stderr_nonempty"] = bool(stderr_text)
-            except OSError as exc:
-                metadata["latency_seconds"] = time.monotonic() - started
-                self._write_event_evidence(events_path, "", metadata)
-                self._write_stderr_evidence(stderr_path, "", metadata)
-                raise ModelServiceError(
-                    "failed to start Codex CLI process",
-                    error_code="codex_process_start_failed",
-                ) from exc
-            except subprocess.TimeoutExpired as exc:
-                event_text = exc.stdout or ""
-                stderr_text = exc.stderr or ""
-                if isinstance(event_text, bytes):
-                    event_text = event_text.decode("utf-8", errors="replace")
-                if isinstance(stderr_text, bytes):
-                    stderr_text = stderr_text.decode("utf-8", errors="replace")
-                metadata["codex_stderr_nonempty"] = bool(stderr_text)
-                metadata["latency_seconds"] = time.monotonic() - started
-                metadata["raw_structured_output"] = None
-                self._write_event_evidence(events_path, event_text, metadata)
-                self._write_stderr_evidence(stderr_path, stderr_text, metadata)
-                try:
-                    metadata["tool_call_events"] = self._tool_events(event_text)
-                    metadata["tool_call_detected"] = bool(metadata["tool_call_events"])
-                    metadata["token_usage"] = self._token_usage(event_text)
-                except AstraEvaluationError as event_error:
-                    metadata.update(safe_exception_record(event_error))
-                self._save_metadata(step_dir, metadata)
-                raise InferenceDeadlineExceeded(
-                    f"configured Codex inference deadline of {self.timeout:g} seconds exceeded",
-                    error_code="inference_deadline_exceeded",
-                ) from exc
-
-        metadata["latency_seconds"] = time.monotonic() - started
-        self._write_event_evidence(events_path, event_text, metadata)
-        self._write_stderr_evidence(stderr_path, stderr_text, metadata)
-        metadata["raw_structured_output"] = None
         try:
-            metadata["tool_call_events"] = self._tool_events(event_text)
-            metadata["tool_call_detected"] = bool(metadata["tool_call_events"])
-            metadata["token_usage"] = self._token_usage(event_text)
-            metadata["resolved_model"] = self._resolved_model(event_text)
-        except AstraEvaluationError as exc:
-            metadata.update(safe_exception_record(exc))
+            cwd_path.relative_to(REPO_ROOT)
+        except ValueError:
+            pass
+        else:
+            raise ModelServiceError("Codex working directory must be outside the repository",
+                                    error_code="unsafe_codex_working_directory")
+        inherited_context = self._inherited_context_files(cwd_path)
+        metadata["codex_inherited_context_files"] = inherited_context
+        if inherited_context:
+            raise ModelServiceError(
+                "Codex control working directory inherits project instructions/configuration",
+                error_code="inherited_codex_context",
+            )
+        if os.listdir(cwd_path):
+            raise ModelServiceError("Codex control working directory is not empty",
+                                    error_code="nonempty_codex_working_directory")
+
+        if self._session is None:
+            self._session = CodexAppServerSession(
+                codex, cwd_path, self.model, self.reasoning_effort, self.timeout,
+            )
+            self._session_started_at = datetime.now(timezone.utc).isoformat()
+            developer_instructions = (
+                "You are a controller for one RLBench robot task episode. Follow only "
+                "the control instructions and observations supplied in this thread. "
+                "Do not use tools, inspect files, or access external information. "
+                "Return only the requested structured action."
+            )
+            thread_identity = self._session.create_thread(developer_instructions)
+            metadata.update({
+                "thread_id": thread_identity["thread_id"],
+                "control_session_id": thread_identity["session_id"],
+                "resolved_model": thread_identity["resolved_model"],
+                "app_server_info": thread_identity["app_server_info"],
+                "thread_instruction_sources": thread_identity["instruction_sources"],
+                "app_server_session_create_count": 1,
+                "app_server_process_count": 1,
+            })
+            # The real ID binding is durable before the first target can return.
+            self._write_session_manifest("active")
+        elif self._session.failed or self._session.closed:
+            raise ModelServiceError(
+                "Codex episode thread is unusable; refusing to create a replacement",
+                error_code="control_session_unusable",
+            )
+        else:
+            metadata.update({
+                "thread_id": self._session.thread_id,
+                "control_session_id": self._session.session_id,
+                "resolved_model": self._session.resolved_model,
+                "app_server_session_create_count": 0,
+                "app_server_process_count": 0,
+            })
+
+        request = {
+            "event": "turn_input",
+            "evaluation_id": self._evaluation_context.get("evaluation_id"),
+            "repeat_id": self._evaluation_context.get("repeat_id"),
+            "task": self._evaluation_context.get("task"),
+            "episode_id": self._evaluation_context.get("episode_id"),
+            "thread_id": self._session.thread_id,
+            "session_id": self._session.session_id,
+            "step_id": step_id,
+            "observation_id": observation_id,
+            "action_id": action_id,
+            "message_text": prompt,
+            "images": [
+                {"camera_name": camera, "observation_id": observation_id,
+                 "path": image_paths[camera]}
+                for camera in self.IMAGE_FIELDS
+            ],
+            "output_schema": self._schema_for_mode(self.collision_mode),
+            "status": "submitted",
+        }
+        self._append_control_record(request)
+        started = time.monotonic()
+        request_count_before = (
+            0 if metadata.get("app_server_session_create_count")
+            else self._session.rpc_request_count
+        )
+        try:
+            final_text, turn_metadata = self._session.run_turn(
+                prompt, image_paths, self._schema_for_mode(self.collision_mode)
+            )
+            self._bind_session_turn(
+                step_id, action_id, observation_id, turn_metadata, "completed"
+            )
+        except Exception as exc:
+            turn_metadata = dict(self._session.last_turn_metadata)
+            self._bind_session_turn(
+                step_id, action_id, observation_id, turn_metadata, "rejected"
+            )
+            metadata.update({
+                "thread_id": self._session.thread_id,
+                "control_session_id": self._session.session_id,
+                "turn_id": turn_metadata.get("turn_id"),
+                "turn_end_confirmed": turn_metadata.get("turn_end_confirmed"),
+                "tool_call_detected": turn_metadata.get("tool_call_detected", False),
+                "tool_call_events": turn_metadata.get("tool_call_events", []),
+                "app_server_request_count": (
+                    self._session.rpc_request_count - request_count_before
+                ),
+                "latency_seconds": time.monotonic() - started,
+            })
+            event_text = "".join(
+                json.dumps({
+                    "type": event.get("method", "unknown"),
+                    **({"item": {"type": event["item_type"]}}
+                       if event.get("item_type") is not None else {}),
+                }) + "\n"
+                for event in turn_metadata.get("event_evidence", [])
+            )
+            self._write_event_evidence(events_path, event_text, metadata)
+            self._write_session_manifest("failed")
+            self._append_control_record({
+                "event": "turn_result", "thread_id": self._session.thread_id,
+                "session_id": self._session.session_id,
+                "step_id": step_id, "observation_id": observation_id,
+                "action_id": action_id, "turn_id": turn_metadata.get("turn_id"),
+                "status": "rejected", "error_code": getattr(exc, "error_code", "unknown"),
+                "turn_end_confirmed": turn_metadata.get("turn_end_confirmed"),
+                "tool_call_detected": turn_metadata.get("tool_call_detected", False),
+            })
             self._save_metadata(step_dir, metadata)
             raise
 
-        self._save_metadata(step_dir, metadata)
-        if metadata["tool_call_detected"]:
-            raise PolicyToolViolation(
-                "Codex inference used a tool; refusing to return its action",
-                error_code="tool_event_detected",
-            )
-        if completed.returncode != 0:
-            raise ModelServiceError(
-                f"Codex CLI exited with code {completed.returncode}; sanitized stderr is recorded",
-                error_code="codex_cli_nonzero_exit",
-            )
-        if not raw_output_path.is_file():
-            raise InvalidPolicyOutput(
-                "Codex did not create a structured action output",
-                error_code="missing_action_output",
-            )
+        metadata.update({
+            "thread_id": turn_metadata["thread_id"],
+            "control_session_id": turn_metadata["session_id"],
+            "turn_id": turn_metadata["turn_id"],
+            "turn_end_confirmed": turn_metadata["turn_end_confirmed"],
+            "turn_started_confirmed": turn_metadata["turn_started_confirmed"],
+            "tool_call_detected": turn_metadata["tool_call_detected"],
+            "tool_call_events": turn_metadata["tool_call_events"],
+            "app_server_request_count": (
+                self._session.rpc_request_count - request_count_before
+            ),
+            "latency_seconds": turn_metadata["latency_seconds"],
+            "resolved_model": self._session.resolved_model,
+            "model_output_byte_length": len(final_text.encode("utf-8")),
+        })
+        self._transient_final_text = final_text
+        event_text = "".join(
+            json.dumps({
+                "type": event.get("method", "unknown"),
+                **({"item": {"type": event["item_type"]}}
+                   if event.get("item_type") is not None else {}),
+            }) + "\n"
+            for event in turn_metadata.get("event_evidence", [])
+        )
+        self._write_event_evidence(events_path, event_text, metadata)
+        self._write_session_manifest("active")
 
         try:
-            raw_bytes = raw_output_path.read_bytes()
-            metadata["model_output_byte_length"] = len(raw_bytes)
+            raw_bytes = final_text.encode("utf-8")
             if len(raw_bytes) > MAX_REJECTED_OUTPUT_BYTES:
-                raise InvalidPolicyOutput(
-                    "structured action output exceeded the size limit",
-                    error_code="action_output_too_large",
-                )
-            action_data = json.loads(raw_bytes.decode("utf-8"))
+                raise InvalidPolicyOutput("structured action output exceeded the size limit",
+                                          error_code="action_output_too_large")
+            action_data = json.loads(final_text)
         except InvalidPolicyOutput:
             raise
-        except (OSError, UnicodeDecodeError, TypeError, json.JSONDecodeError) as exc:
-            raise InvalidPolicyOutput(
-                "Codex action output was not valid JSON",
-                error_code="invalid_action_json",
-            ) from exc
+        except (UnicodeEncodeError, TypeError, json.JSONDecodeError) as exc:
+            raise InvalidPolicyOutput("Codex final message was not valid JSON",
+                                      error_code="invalid_action_json") from exc
         if not isinstance(action_data, dict):
-            raise InvalidPolicyOutput(
-                "Codex action must be a JSON object",
-                error_code="invalid_action_structure",
-            )
+            raise InvalidPolicyOutput("Codex action must be a JSON object",
+                                      error_code="invalid_action_structure")
         expected_keys = {"position", "quaternion", "gripper"}
         if self.collision_mode == "predict":
             expected_keys.add("ignore_collisions")
         if set(action_data) != expected_keys:
-            raise InvalidPolicyOutput(
-                "Codex action contains missing or unexpected fields",
-                error_code="invalid_action_fields",
-            )
+            raise InvalidPolicyOutput("Codex action contains missing or unexpected fields",
+                                      error_code="invalid_action_fields")
+
         position = self._number_list(action_data["position"], 3, "position")
         quaternion = self._number_list(action_data["quaternion"], 4, "quaternion")
-        raw_quaternion_norm = math.hypot(*quaternion)
-        if raw_quaternion_norm <= 1e-8:
-            raise InvalidPolicyOutput(
-                "Codex quaternion norm is too small",
-                error_code="invalid_quaternion_norm",
-            )
+        quaternion_norm = math.hypot(*quaternion)
+        if quaternion_norm <= 1e-8:
+            raise InvalidPolicyOutput("Codex quaternion norm is too small",
+                                      error_code="invalid_quaternion_norm")
         gripper = action_data["gripper"]
         if isinstance(gripper, bool) or not isinstance(gripper, int) or gripper not in (0, 1):
-            raise InvalidPolicyOutput(
-                "Codex gripper must be integer 0 or 1",
-                error_code="invalid_gripper",
-            )
+            raise InvalidPolicyOutput("Codex gripper must be integer 0 or 1",
+                                      error_code="invalid_gripper")
         if self.collision_mode == "predict":
             collision = action_data["ignore_collisions"]
             if isinstance(collision, bool) or not isinstance(collision, int) or collision not in (0, 1):
-                raise InvalidPolicyOutput(
-                    "ignore_collisions must be integer 0 or 1 in predict mode",
-                    error_code="invalid_collision_flag",
-                )
+                raise InvalidPolicyOutput("ignore_collisions must be integer 0 or 1",
+                                          error_code="invalid_collision_flag")
 
-        metadata["quaternion_norm"] = raw_quaternion_norm
+        metadata["quaternion_norm"] = quaternion_norm
         metadata["parsed_policy_action"] = {
-            "position": position,
-            "quaternion": quaternion,
+            "position": position, "quaternion": quaternion,
             "gripper": gripper,
             "ignore_collisions": action_data.get("ignore_collisions"),
-            "quaternion_norm": raw_quaternion_norm,
+            "quaternion_norm": quaternion_norm,
             "normalization_applied": False,
         }
-        self._write_json(accepted_action_path, {
-            "position": position,
-            "quaternion": quaternion,
-            "gripper": gripper,
+        safe_action = {
+            "position": position, "quaternion": quaternion, "gripper": gripper,
             **({"ignore_collisions": action_data["ignore_collisions"]}
                if self.collision_mode == "predict" else {}),
-        })
+        }
+        self._write_json(accepted_action_path, safe_action)
         metadata["accepted_action_path"] = str(accepted_action_path)
         metadata["action_json_path"] = str(accepted_action_path)
         self._save_metadata(step_dir, metadata)
-        try:
-            raw_output_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        self._append_control_record({
+            "event": "turn_result", "thread_id": self._session.thread_id,
+            "session_id": self._session.session_id,
+            "step_id": step_id, "observation_id": observation_id,
+            "action_id": action_id, "turn_id": turn_metadata["turn_id"],
+            "final_structured_output": safe_action,
+            "accepted": True,
+        })
+        self._last_action_binding = {
+            "step_id": step_id, "action_id": action_id,
+            "turn_id": turn_metadata["turn_id"],
+        }
+        self._feedback_recorded_action_id = None
+        self._pending_feedback = None
+        self._transient_final_text = None
+        self._write_session_manifest("active")
         return AstraAction(
-            position=position,
-            quaternion=quaternion,
-            gripper=gripper,
+            position=position, quaternion=quaternion, gripper=gripper,
             ignore_collisions=action_data.get("ignore_collisions"),
         )
+
+    def close(self):
+        if self._session is not None:
+            self.end_episode("policy_closed")
 
     @staticmethod
     def _resolved_model(event_text):

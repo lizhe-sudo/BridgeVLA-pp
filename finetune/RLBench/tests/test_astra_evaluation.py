@@ -217,7 +217,7 @@ class RunEvalIntegrationTests(unittest.TestCase):
             root = Path(temp_dir)
             task_dir = root / "fake_tasks"
             task_dir.mkdir()
-            for name in ("place_cups", "stack_blocks", "meat_off_grill"):
+            for name in ("place_cups", "stack_blocks", "meat_off_grill", "open_drawer"):
                 (task_dir / f"{name}.py").write_text("# fake task\n", encoding="utf-8")
             data_dir = root / "data"
             data_dir.mkdir()
@@ -396,6 +396,92 @@ class RunEvalIntegrationTests(unittest.TestCase):
             mock_policy_module.ManualPolicy = FakePolicy
             modules["astra.mock_policy"] = mock_policy_module
 
+            codex_policy_module = types.ModuleType("astra.codex_policy")
+
+            class FakeCodexPolicy:
+                instances = []
+                codex_cli_version = "fake-app-server-version"
+                codex_cli_version_probe_invocation_count = 0
+
+                def __init__(self, **kwargs):
+                    self.last_metadata = None
+                    self.step = 0
+                    self.feedback = None
+                    self.seen_inputs = []
+                    self.context = {}
+                    self.thread_id = f"fake-thread-{len(self.instances) + 1}"
+                    self.session_id = f"fake-session-{len(self.instances) + 1}"
+                    self.turn_ids = []
+                    self.__class__.instances.append(self)
+
+                @staticmethod
+                def _schema_for_mode(_mode):
+                    return {"type": "object", "required": [
+                        "position", "quaternion", "gripper",
+                    ]}
+
+                def set_evaluation_context(self, **context):
+                    self.context = context
+
+                def reset(self, instruction):
+                    self.instruction = instruction
+                    self.step = 0
+                    self.feedback = None
+
+                def observation_id_for_step(self, step):
+                    return (
+                        f"{self.context['evaluation_id']}:r{self.context['repeat_id']}:"
+                        f"{self.context['task']}:ep{self.context['episode_id']}:obs{step:03d}"
+                    )
+
+                def act(self, observation):
+                    step = self.step
+                    self.seen_inputs.append({
+                        "step": step,
+                        "feedback": None if self.feedback is None else dict(self.feedback),
+                        "image_shapes": {key: list(value.shape) for key, value in observation.images.items()},
+                    })
+                    self.step += 1
+                    action_id = f"fake-action-{step}"
+                    turn_id = f"fake-turn-{step}"
+                    self.turn_ids.append(turn_id)
+                    self.last_metadata = {
+                        **self.context,
+                        "step_id": step,
+                        "thread_id": self.thread_id,
+                        "control_session_id": self.session_id,
+                        "turn_id": turn_id,
+                        "action_id": action_id,
+                        "observation_id": self.observation_id_for_step(step),
+                        "policy_type": "codex_app_server",
+                        "codex_cli_version": self.codex_cli_version,
+                        "cli_invocation_count": 0,
+                        "app_server_request_count": 1,
+                        "app_server_session_create_count": int(step == 0),
+                        "latency_seconds": 0.001,
+                        "token_usage": None,
+                        "tool_call_detected": False,
+                    }
+                    position = [float(observation.eef_pose[0]) + 0.05,
+                                float(observation.eef_pose[1]),
+                                float(observation.eef_pose[2])]
+                    return AstraAction(position, list(observation.eef_pose[3:7]), 1)
+
+                def record_execution_feedback(self, feedback):
+                    expected = self.last_metadata["action_id"]
+                    if feedback.get("action_id") != expected:
+                        raise AssertionError("feedback was bound to a different action")
+                    self.feedback = dict(feedback)
+
+                def end_episode(self, _reason):
+                    pass
+
+                def close(self):
+                    pass
+
+            codex_policy_module.CodexAstraPolicy = FakeCodexPolicy
+            modules["astra.codex_policy"] = codex_policy_module
+
             with mock.patch.dict(sys.modules, modules), \
                  mock.patch.object(eval_astra, "_add_project_paths", return_value={
                      "rlbench_sim_stack": None, "pyrep_sim_stack": None,
@@ -413,12 +499,29 @@ class RunEvalIntegrationTests(unittest.TestCase):
                 ])
                 results = eval_astra.run_eval(args)
 
+                # Run the actual evaluator loop for three consecutive codex
+                # decisions, using a fake native policy boundary and the same
+                # fake RLBench environment. This exercises feedback ordering
+                # between the evaluator and policy rather than only the builder.
+                first_execution_order = list(execution_order)
+                execution_order.clear()
+                codex_output_root = root / "codex outputs"
+                codex_args = eval_astra._build_parser().parse_args([
+                    "--tasks", "open_drawer", "--policy", "codex",
+                    "--run-mode", "debug", "--budget-protocol", "uniform25",
+                    "--eval-episodes", "1", "--repeats", "1",
+                    "--start-episode", "0", "--max-waypoints", "3",
+                    "--collision-mode", "fixed0", "--no-record-video",
+                    "--output-root", str(codex_output_root),
+                ])
+                codex_results = eval_astra.run_eval(codex_args)
+
             expected_prefix = [
                 ("place_cups", 0), ("place_cups", 0),
                 ("stack_blocks", 0), ("stack_blocks", 0),
                 ("meat_off_grill", 0),
             ]
-            self.assertEqual(execution_order, expected_prefix, repr(results))
+            self.assertEqual(first_execution_order, expected_prefix, repr(results))
             self.assertEqual(len(policy_calls), 5)
             self.assertEqual(len(results), 5)
             run_dir = next(output_root.glob("astra_*"))
@@ -462,6 +565,27 @@ class RunEvalIntegrationTests(unittest.TestCase):
             self.assertEqual(summary["policy_failures"], 2)
             self.assertEqual(summary["infrastructure_errors"], 1)
             self.assertEqual(summary["completion_status"], "incomplete")
+            self.assertEqual(len(codex_results), 1)
+            self.assertEqual(codex_results[0]["policy_decision_count"], 3)
+            self.assertEqual(codex_results[0]["environment_action_attempt_count"], 3)
+            self.assertEqual(codex_results[0]["app_server_session_create_count"], 1)
+            self.assertEqual(codex_results[0]["app_server_turn_count"], 3)
+            fake_policy = FakeCodexPolicy.instances[-1]
+            self.assertEqual(len(fake_policy.seen_inputs), 3)
+            self.assertIsNone(fake_policy.seen_inputs[0]["feedback"])
+            self.assertEqual(
+                [item["feedback"]["action_id"] for item in fake_policy.seen_inputs[1:]],
+                ["fake-action-0", "fake-action-1"],
+            )
+            self.assertEqual(len(set(fake_policy.turn_ids)), 3)
+            self.assertTrue(all(shape == [8, 8, 3] for shape in
+                                fake_policy.seen_inputs[2]["image_shapes"].values()))
+            feedback1 = fake_policy.seen_inputs[1]["feedback"]
+            self.assertNotEqual(
+                feedback1["requested_target_pose"]["position"],
+                feedback1["eef_pose_after"][:3],
+            )
+            self.assertNotIn("reward", feedback1)
 
 
 class OutputLayoutTests(unittest.TestCase):
@@ -614,7 +738,7 @@ class ActionContractTests(unittest.TestCase):
 
 
 class PolicyMetadataTests(unittest.TestCase):
-    def test_cli_cwd_context_check_detects_ancestor_instructions(self):
+    def test_control_cwd_context_check_detects_ancestor_instructions(self):
         from astra.codex_policy import CodexAstraPolicy
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -627,214 +751,6 @@ class PolicyMetadataTests(unittest.TestCase):
             self.assertEqual(
                 CodexAstraPolicy._inherited_context_files(cwd), [str(instruction)]
             )
-
-    def test_second_step_early_exception_does_not_reuse_first_call_metadata(self):
-        from astra.codex_policy import CodexAstraPolicy
-
-        captured_commands = []
-
-        def fake_run(command, **kwargs):
-            if command[-1] == "--version":
-                return __import__("subprocess").CompletedProcess(
-                    command, 0, "codex-cli fake-1\n", ""
-                )
-            captured_commands.append((list(command), kwargs["cwd"]))
-            output_path = command[command.index("--output-last-message") + 1]
-            Path(output_path).write_text(json.dumps({
-                "position": [0.1, 0.2, 0.3],
-                "quaternion": [0, 0, 0, 1],
-                "gripper": 1,
-            }), encoding="utf-8")
-            events = json.dumps({"type": "turn.completed", "usage": {
-                "input_tokens": 11, "output_tokens": 3,
-                "reasoning_output_tokens": 2,
-            }}) + "\n"
-            return __import__("subprocess").CompletedProcess(command, 0, events, "")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            work_root = Path(temp_dir) / "policy work 空间"
-            with mock.patch("astra.codex_policy.shutil.which", return_value="/fake/codex"), \
-                 mock.patch("astra.codex_policy.subprocess.run", side_effect=fake_run):
-                policy = CodexAstraPolicy(work_root=work_root)
-                policy.reset("place a cup")
-                policy.set_evaluation_context("eval-1", 2, "place_cups", 7)
-                images = {name: np.zeros((8, 8, 3), dtype=np.uint8)
-                          for name in policy.IMAGE_FIELDS}
-                observation = AstraObservation("place a cup", images,
-                                               [0, 0, 0, 0, 0, 0, 1], True)
-                policy.act(observation)
-                first = dict(policy.last_metadata)
-                self.assertEqual(first["cli_invocation_count"], 1)
-                self.assertTrue(first["codex_context_files_checked"])
-                self.assertEqual(first["codex_inherited_context_files"], [])
-                self.assertEqual(first["token_usage"]["input_tokens"], 11)
-                self.assertTrue(Path(first["accepted_action_path"]).is_file())
-                self.assertFalse(Path(first["raw_model_output_path"]).exists())
-                command, cwd = captured_commands[0]
-                image_args = [command[index + 1] for index, value in enumerate(command[:-1])
-                              if value == "-i"]
-                expected_images = [str(work_root / policy._episode_dir.name / "step_000"
-                                        / f"{camera}.png")
-                                   for camera in policy.IMAGE_FIELDS]
-                self.assertEqual(image_args, expected_images)
-                self.assertEqual(command[-1], first["prompt"])
-                self.assertNotEqual(Path(cwd).parent, work_root)
-                self.assertFalse(Path(cwd).exists())
-                self.assertEqual(command.count("-i"), 4)
-                broken = AstraObservation("place a cup", images,
-                                          [float("nan"), 0, 0, 0, 0, 0, 1], True)
-                with self.assertRaises(Exception):
-                    policy.act(broken)
-                second = policy.last_metadata
-                self.assertEqual(second["step_id"], 1)
-                self.assertEqual(second["cli_invocation_count"], 0)
-                self.assertIsNone(second["token_usage"])
-                self.assertNotIn("prompt", second)
-                self.assertNotEqual(first.get("error"), second.get("error"))
-
-    def test_rejected_action_and_stderr_are_bounded_redacted_diagnostics(self):
-        from astra.codex_policy import CodexAstraPolicy
-        from astra.errors import InvalidPolicyOutput
-
-        credentials = (
-            "FAKE_API_SECRET_123456", "FAKE_BEARER_SECRET_987654",
-            "FAKE_EVENT_TOKEN_ABCDEF",
-        )
-
-        def fake_run(command, **kwargs):
-            if command[-1] == "--version":
-                return __import__("subprocess").CompletedProcess(
-                    command, 0, "codex-cli fake-1\n", ""
-                )
-            output_path = command[command.index("--output-last-message") + 1]
-            Path(output_path).write_text(json.dumps({
-                "position": [0.1, 0.2, 0.3],
-                "quaternion": [0, 0, 0, 1],
-                "gripper": 1,
-                "api_key": credentials[0],
-            }), encoding="utf-8")
-            event_text = json.dumps({
-                "type": "turn.completed",
-                "item": {"type": "agent_message", "text": f"token={credentials[2]}"},
-            }) + "\n"
-            return __import__("subprocess").CompletedProcess(
-                command, 0, event_text,
-                f"Unknown CLI option --bad-option Authorization: Bearer {credentials[1]}",
-            )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            work_root = Path(temp_dir) / "policy work"
-            policy = None
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with mock.patch("astra.codex_policy.shutil.which", return_value="/fake/codex"), \
-                 mock.patch("astra.codex_policy.subprocess.run", side_effect=fake_run), \
-                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                policy = CodexAstraPolicy(work_root=work_root)
-                policy.reset("test task")
-                policy.set_evaluation_context("eval-2", 1, "test_task", 0)
-                images = {name: np.zeros((4, 4, 3), dtype=np.uint8)
-                          for name in policy.IMAGE_FIELDS}
-                observation = AstraObservation("test task", images,
-                                               [0, 0, 0, 0, 0, 0, 1], True)
-                with self.assertRaises(InvalidPolicyOutput):
-                    policy.act(observation)
-            metadata = policy.last_metadata
-            self.assertEqual(metadata["error_code"], "invalid_action_fields")
-            self.assertEqual(metadata["step_id"], 0)
-            self.assertEqual(metadata["cli_invocation_count"], 1)
-            self.assertFalse(Path(metadata["accepted_action_path"]).exists())
-            rejected = json.loads(Path(metadata["rejected_output_path"]).read_text())
-            self.assertEqual(rejected["status"], "rejected")
-            self.assertEqual(rejected["action_fields"]["position"], [0.1, 0.2, 0.3])
-            self.assertEqual(rejected["unexpected_field_count"], 1)
-            stderr_path = Path(metadata["event_jsonl_path"]).with_name("codex_stderr.log")
-            stderr_text = stderr_path.read_text(encoding="utf-8")
-            self.assertIn("Unknown CLI option --bad-option", stderr_text)
-            persisted = "\n".join(
-                path.read_text(encoding="utf-8", errors="ignore")
-                for path in work_root.rglob("*") if path.is_file()
-            )
-            for credential in credentials:
-                self.assertNotIn(credential, persisted)
-                self.assertNotIn(credential, stdout.getvalue())
-                self.assertNotIn(credential, stderr.getvalue())
-
-    def test_tool_event_is_rejected_before_action_is_accepted(self):
-        from astra.codex_policy import CodexAstraPolicy
-        from astra.errors import PolicyToolViolation
-
-        def fake_run(command, **kwargs):
-            if command[-1] == "--version":
-                return __import__("subprocess").CompletedProcess(command, 0, "v1", "")
-            output_path = command[command.index("--output-last-message") + 1]
-            Path(output_path).write_text(json.dumps({
-                "position": [0, 0, 0], "quaternion": [0, 0, 0, 1], "gripper": 1,
-            }), encoding="utf-8")
-            events = json.dumps({"type": "command_execution", "command": "ignored"}) + "\n"
-            return __import__("subprocess").CompletedProcess(command, 0, events, "")
-
-        with tempfile.TemporaryDirectory() as temp_dir, \
-             mock.patch("astra.codex_policy.shutil.which", return_value="/fake/codex"), \
-             mock.patch("astra.codex_policy.subprocess.run", side_effect=fake_run):
-            policy = CodexAstraPolicy(work_root=Path(temp_dir) / "policy")
-            policy.reset("test")
-            images = {name: np.zeros((4, 4, 3), dtype=np.uint8)
-                      for name in policy.IMAGE_FIELDS}
-            obs = AstraObservation("test", images, [0, 0, 0, 0, 0, 0, 1], True)
-            with self.assertRaises(PolicyToolViolation):
-                policy.act(obs)
-            self.assertFalse(Path(policy.last_metadata["accepted_action_path"]).exists())
-            evidence = json.loads(Path(policy.last_metadata["rejected_output_path"]).read_text())
-            self.assertEqual(evidence["reason_code"], "tool_event_detected")
-
-    def test_cli_service_error_keeps_redacted_exit_diagnostics(self):
-        from astra.codex_policy import CodexAstraPolicy
-        from astra.errors import ModelServiceError
-
-        secret = "FAKE_SERVICE_SECRET_012345"
-
-        def fake_run(command, **kwargs):
-            if command[-1] == "--version":
-                return __import__("subprocess").CompletedProcess(
-                    command, 0, "codex-cli fake-1\n", ""
-                )
-            return __import__("subprocess").CompletedProcess(
-                command, 2, '{"type":"turn.failed"}\n',
-                f"Unknown CLI option --bad-option api_key={secret}",
-            )
-
-        with tempfile.TemporaryDirectory() as temp_dir, \
-             mock.patch("astra.codex_policy.shutil.which", return_value="/fake/codex"), \
-             mock.patch("astra.codex_policy.subprocess.run", side_effect=fake_run):
-            work_root = Path(temp_dir) / "policy"
-            policy = CodexAstraPolicy(work_root=work_root)
-            policy.reset("test task")
-            policy.set_evaluation_context("eval-service", 1, "stack_cups", 0)
-            images = {name: np.zeros((4, 4, 3), dtype=np.uint8)
-                      for name in policy.IMAGE_FIELDS}
-            observation = AstraObservation(
-                "test task", images, [0, 0, 0, 0, 0, 0, 1], True
-            )
-            with self.assertRaises(ModelServiceError) as raised:
-                policy.act(observation)
-            self.assertEqual(raised.exception.error_code, "codex_cli_nonzero_exit")
-            self.assertEqual(
-                eval_astra._classify_error(raised.exception, "policy")[0],
-                "infrastructure_error",
-            )
-            metadata = policy.last_metadata
-            self.assertEqual(metadata["codex_return_code"], 2)
-            self.assertEqual(metadata["cli_invocation_count"], 1)
-            self.assertIn("Unknown CLI option --bad-option", metadata["stderr_summary"])
-            self.assertNotIn(secret, metadata["stderr_summary"])
-            rejected = json.loads(Path(metadata["rejected_output_path"]).read_text())
-            self.assertEqual(rejected["status"], "no_output_file")
-            persisted = "\n".join(
-                path.read_text(encoding="utf-8", errors="ignore")
-                for path in work_root.rglob("*") if path.is_file()
-            )
-            self.assertNotIn(secret, persisted)
 
     def test_mock_artifacts_are_never_labeled_as_model_runs(self):
         from astra.episode_recorder import EpisodeRecorder
@@ -917,7 +833,8 @@ class FakeStepTests(unittest.TestCase):
         from astra.episode_recorder import EpisodeRecorder
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = EpisodeRecorder(temp_dir, "stack_cups", 0,
-                                       record_video=True, view_size=4, fps=5)
+                                       record_video=True, recording_width=4,
+                                       recording_height=2, fps=5)
             recorder._camera_rig = self.CameraRig()
             recorder._render = lambda *args, **kwargs: np.zeros((8, 8, 3), dtype=np.uint8)
             motion_frames_per_action = []
@@ -951,7 +868,8 @@ class FakeStepTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = EpisodeRecorder(temp_dir, "stack_cups", 0,
-                                       record_video=True, view_size=4, fps=5)
+                                       record_video=True, recording_width=4,
+                                       recording_height=2, fps=5)
             recorder._camera_rig = BrokenRig()
             scene = self.Scene()
             original_step = scene.step
@@ -1010,7 +928,7 @@ class FakeStepTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = EpisodeRecorder(temp_dir, "stack_cups", 0,
-                                       record_video=True, policy_type="codex_cli")
+                                       record_video=True, policy_type="codex_app_server")
             recorder._camera_rig = self.CameraRig()
             summary = {"success": True, "reward": 100, "termination_reason": "task_success"}
             recorder.write_summary(summary)
@@ -1128,7 +1046,8 @@ class FakeStepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             for record_video in (False, True):
                 recorder = EpisodeRecorder(temp_dir, f"task_{record_video}", 0,
-                                           record_video=record_video, view_size=4, fps=5)
+                                           record_video=record_video, recording_width=4,
+                                           recording_height=2, fps=5)
                 if record_video:
                     recorder._camera_rig = self.CameraRig()
                     recorder._render = lambda *args, **kwargs: np.zeros((8, 8, 3), dtype=np.uint8)
