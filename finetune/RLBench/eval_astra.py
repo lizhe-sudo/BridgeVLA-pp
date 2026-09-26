@@ -89,20 +89,12 @@ def _build_parser():
     )
     parser.add_argument(
         "--record-video", action=argparse.BooleanOptionalAction, default=True,
-        help="record a fixed third-person episode video (default: true)",
+        help="record a four-view Luna input video (default: true)",
     )
-    parser.add_argument("--recording-azimuth", type=float, default=225.0,
-                        help="recording camera horizontal azimuth in degrees")
-    parser.add_argument("--recording-elevation", type=float, default=30.0,
-                        help="recording camera elevation in degrees")
-    parser.add_argument("--recording-width", type=int, default=1280,
-                        help="recording camera width in pixels")
-    parser.add_argument("--recording-height", type=int, default=720,
-                        help="recording camera height in pixels")
+    parser.add_argument("--recording-view-size", type=int, default=512,
+                        help="square output size of each camera tile")
     parser.add_argument("--recording-fps", type=int, default=20,
                         help="output video frame rate")
-    parser.add_argument("--recording-radius", type=float, default=None,
-                        help="fixed camera orbit radius in meters (auto if omitted)")
     parser.add_argument("--log-file", default=None,
                         help="optional JSONL file for per-step logs")
     return parser
@@ -204,12 +196,10 @@ def run_eval(args):
         raise ValueError("--episode-length must be positive")
     if args.start_episode < 0:
         raise ValueError("--start-episode must be non-negative")
-    if args.recording_width <= 0 or args.recording_height <= 0:
-        raise ValueError("recording dimensions must be positive")
+    if args.recording_view_size <= 0:
+        raise ValueError("--recording-view-size must be positive")
     if args.recording_fps <= 0:
         raise ValueError("--recording-fps must be positive")
-    if args.recording_radius is not None and args.recording_radius <= 0:
-        raise ValueError("--recording-radius must be positive")
 
     manual_action = _parse_manual_action(args.manual_action)
     if args.policy == "manual" and manual_action is None:
@@ -298,12 +288,8 @@ def run_eval(args):
                     model=args.codex_model,
                     reasoning=args.codex_reasoning,
                     record_video=args.record_video,
-                    azimuth_deg=args.recording_azimuth,
-                    elevation_deg=args.recording_elevation,
-                    width=args.recording_width,
-                    height=args.recording_height,
+                    view_size=args.recording_view_size,
                     fps=args.recording_fps,
-                    radius=args.recording_radius,
                 )
                 eval_env._last_exception = None
                 try:
@@ -341,7 +327,7 @@ def run_eval(args):
                     continue
 
                 try:
-                    recorder.initialize_camera(eval_env._task._scene)
+                    recorder.initialize_camera(eval_env._task._scene, raw_obs)
                     for step in range(args.episode_length):
                         policy_output = None
                         final_action = None

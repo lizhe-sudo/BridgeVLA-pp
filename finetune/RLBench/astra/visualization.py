@@ -2,7 +2,6 @@
 
 import math
 import os
-import textwrap
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -12,8 +11,14 @@ GREEN = (45, 220, 90)
 RED = (245, 55, 55)
 BLUE = (55, 130, 255)
 WHITE = (240, 243, 248)
-MUTED = (165, 176, 190)
 PANEL = (15, 20, 28)
+
+POLICY_CAMERA_LABELS = {
+    "front": "FRONT",
+    "left_shoulder": "LEFT SHOULDER",
+    "right_shoulder": "RIGHT SHOULDER",
+    "wrist": "WRIST",
+}
 
 
 def orientation_error_degrees(target_quaternion, actual_quaternion):
@@ -43,22 +48,6 @@ def _font(size, bold=False):
     return ImageFont.load_default()
 
 
-def _xyz(value):
-    if value is None:
-        return "N/A"
-    try:
-        values = [float(x) for x in value[:3]]
-    except (TypeError, ValueError, IndexError):
-        return "N/A"
-    return "[" + ", ".join(f"{x:+.3f}" for x in values) + "]"
-
-
-def _state(value):
-    if value is None:
-        return "N/A"
-    return "OPEN" if bool(value) else "CLOSED"
-
-
 def _project(camera, point):
     if point is None:
         return None, False
@@ -70,14 +59,14 @@ def _project(camera, point):
     return (int(round(x)), int(round(y))), inside
 
 
-def _marker(draw, camera, point, color, label, radius=10, font=None):
+def _marker(draw, camera, point, color, label, radius=8, font=None):
     xy, inside = _project(camera, point)
     if not inside:
         return False
     x, y = xy
     draw.ellipse((x - radius, y - radius, x + radius, y + radius),
                  fill=color, outline=(255, 255, 255), width=2)
-    draw.text((x + radius + 5, y - 12), label, font=font, fill=color,
+    draw.text((x + radius + 4, y - 11), label, font=font, fill=color,
               stroke_width=2, stroke_fill=(0, 0, 0))
     return True
 
@@ -89,147 +78,106 @@ def _line(draw, camera, start, end, color, width=3):
         draw.line((*p1, *p2), fill=color, width=width)
 
 
-def render_recording_view(rgb, camera, phase, current_xyz=None,
-                          target_xyz=None, actual_xyz=None,
-                          target_history=None, panel=None, failure=None):
-    """Render one video frame; input RGB is never modified in place."""
+def render_policy_view(rgb, camera, camera_name, phase, step_index,
+                       current_xyz=None, target_xyz=None, actual_xyz=None,
+                       target_history=None, panel=None, failure=None):
+    """Render one of the actual policy camera views with video-only overlays."""
     image = Image.fromarray(np.asarray(rgb, dtype=np.uint8).copy(), mode="RGB")
-    draw = ImageDraw.Draw(image)
-    marker_font = _font(max(14, camera.height // 48), bold=True)
+    if image.size != (camera.width, camera.height):
+        image = image.resize((camera.width, camera.height), Image.LANCZOS)
+    draw = ImageDraw.Draw(image, "RGBA")
+    marker_font = _font(max(13, camera.height // 40), bold=True)
+    title_font = _font(max(17, camera.height // 30), bold=True)
+    small_font = _font(max(12, camera.height // 48))
     target_history = target_history or []
 
     previous = None
-    for index, waypoint in enumerate(target_history[:-1]):
+    for waypoint in target_history[:-1]:
         xy, visible = _project(camera, waypoint)
         if visible:
             if previous is not None:
-                draw.line((*previous, *xy), fill=(150, 65, 65), width=2)
-            draw.ellipse((xy[0] - 5, xy[1] - 5, xy[0] + 5, xy[1] + 5),
-                         fill=(175, 65, 65))
+                draw.line((*previous, *xy), fill=(180, 75, 75, 220), width=2)
+            draw.ellipse((xy[0] - 4, xy[1] - 4, xy[0] + 4, xy[1] + 4),
+                         fill=(190, 75, 75, 230))
         previous = xy if visible else None
 
-    if phase == "AFTER EXECUTION":
+    if phase == "READY":
+        pass
+    elif phase == "AFTER EXECUTION":
         _line(draw, camera, actual_xyz, target_xyz, BLUE, width=3)
         _marker(draw, camera, actual_xyz, BLUE, "ACTUAL", font=marker_font)
-        _marker(draw, camera, target_xyz, RED, "TARGET", font=marker_font,
-                radius=12)
+        _marker(draw, camera, target_xyz, RED, "TARGET", radius=10,
+                font=marker_font)
     else:
         _line(draw, camera, current_xyz, target_xyz, GREEN, width=3)
         _marker(draw, camera, current_xyz, GREEN, "CURRENT", font=marker_font)
-        _marker(draw, camera, target_xyz, RED, "TARGET", font=marker_font,
-                radius=12)
+        _marker(draw, camera, target_xyz, RED, "TARGET", radius=10,
+                font=marker_font)
         if phase == "EXECUTION" and actual_xyz is not None:
-            _marker(draw, camera, actual_xyz, GREEN, "EEF", radius=7,
+            _marker(draw, camera, actual_xyz, GREEN, "EEF", radius=6,
                     font=marker_font)
 
     panel = dict(panel or {})
-    lines = [
-        ("Task", str(panel.get("task", ""))),
-        ("Instruction", str(panel.get("instruction", ""))),
-        ("Step", str(panel.get("step", ""))),
-        ("Model", str(panel.get("model", "gpt-6-luna"))),
-        ("Reasoning", str(panel.get("reasoning", "max"))),
-        ("Current XYZ", _xyz(current_xyz)),
-        ("Target XYZ", _xyz(target_xyz)),
-        ("Actual XYZ", _xyz(actual_xyz)),
-        ("Position error", panel.get("position_error_m", "N/A")),
-        ("Orientation error", panel.get("orientation_error_deg", "N/A")),
-        ("Gripper before", _state(panel.get("gripper_before"))),
-        ("Luna command", _state(panel.get("gripper_command"))),
-        ("Gripper after", _state(panel.get("gripper_after"))),
-        ("Planner returned", panel.get("planner_returned", "N/A")),
-        ("Target reached", panel.get("target_reached", "N/A")),
-        ("Reward", panel.get("reward", "N/A")),
-        ("Success", panel.get("success", "N/A")),
-        ("Codex latency", panel.get("policy_latency_seconds", "N/A")),
-        ("Input tokens", panel.get("input_tokens", "N/A")),
-        ("Output tokens", panel.get("output_tokens", "N/A")),
-        ("Reasoning tokens", panel.get("reasoning_tokens", "N/A")),
-    ]
-    canvas = Image.new("RGB", (camera.width + camera.panel_width,
-                                camera.height), PANEL)
-    canvas.paste(image, (0, 0))
-    info = ImageDraw.Draw(canvas)
-    title_font = _font(max(18, camera.height // 38), bold=True)
-    value_font = _font(max(12, camera.height // 60))
-    panel_x = camera.width + 18
-    max_chars = max(24, int((camera.panel_width - 36) / max(6, camera.height / 115)))
-    info.text((panel_x, 16), phase, font=title_font, fill=WHITE)
-    y = 58
-    for label, value in lines:
-        wrapped = textwrap.wrap(f"{label}: {value}", width=max_chars) or [""]
-        for part in wrapped[:3]:
-            info.text((panel_x, y), part, font=value_font, fill=WHITE)
-            y += max(16, camera.height // 45)
-        y += max(1, camera.height // 360)
+    label = POLICY_CAMERA_LABELS.get(camera_name, camera_name.upper())
+    header = f"{label}  |  {phase}  |  STEP {step_index}"
+    draw.rectangle((0, 0, camera.width, max(34, camera.height // 12)),
+                   fill=(5, 10, 18, 190))
+    draw.text((12, 6), header, font=title_font, fill=WHITE)
+
+    status_parts = []
+    for key, label in (("planner_returned", "PLAN"),
+                       ("target_reached", "TARGET"),
+                       ("reward", "REWARD")):
+        value = panel.get(key)
+        if value is not None:
+            status_parts.append(f"{label}: {value}")
+    if panel.get("position_error_m") not in (None, "N/A"):
+        status_parts.append(f"ERROR: {panel['position_error_m']}")
+    if status_parts:
+        footer_text = "  |  ".join(status_parts)
+        draw.rectangle((0, camera.height - 30, camera.width, camera.height),
+                       fill=(5, 10, 18, 190))
+        draw.text((12, camera.height - 27), footer_text[:100],
+                  font=small_font, fill=WHITE)
 
     target_xy, target_visible = _project(camera, target_xyz)
     if target_xyz is not None and not target_visible:
-        info.text((18, 16), "TARGET OFF-SCREEN", font=title_font,
-                  fill=(255, 215, 90), stroke_width=2, stroke_fill=(0, 0, 0))
+        draw.rounded_rectangle((8, camera.height - 34, camera.width - 8,
+                                camera.height - 8), radius=6,
+                               fill=(35, 28, 8, 210))
+        draw.text((14, camera.height - 31), "TARGET OFF-SCREEN",
+                  font=small_font, fill=(255, 215, 90))
+
     if failure:
-        banner = f"EXECUTION FAILED: {failure}"
-        info.rectangle((0, camera.height - 54, camera.width, camera.height),
-                       fill=(120, 20, 20))
-        info.text((18, camera.height - 42), banner[:100], font=title_font,
-                  fill=WHITE)
-    return np.asarray(canvas)
-
-
-def render_title_card(width, height, details):
-    image = Image.new("RGB", (width, height), (13, 20, 31))
-    draw = ImageDraw.Draw(image)
-    title = _font(max(28, height // 18), bold=True)
-    body = _font(max(17, height // 36))
-    bold = _font(max(18, height // 34), bold=True)
-    x = int(width * 0.08)
-    y = int(height * 0.12)
-    draw.text((x, y), "GPT-6 Luna Max", font=title, fill=WHITE)
-    y += int(height * 0.09)
-    draw.text((x, y), "RLBench Closed-Loop Control", font=bold,
-              fill=(80, 190, 255))
-    y += int(height * 0.12)
-    text_lines = [
-        f"Task: {details.get('task', '')}",
-        f"Episode: {details.get('episode', '')}",
-        f"Instruction: {details.get('instruction', '')}",
-        f"Model: {details.get('model', 'gpt-6-luna')}",
-        f"Reasoning: {details.get('reasoning', 'max')}",
-        "Action space: Absolute EEF Pose",
-        "Policy views: Front | Left Shoulder | Right Shoulder | Wrist",
-        "Recording view: Fixed third-person",
-        f"Azimuth: {details.get('azimuth_deg', 225.0):.1f} degrees",
-        f"Elevation: {details.get('elevation_deg', 30.0):.1f} degrees",
-    ]
-    for line in text_lines:
-        wrapped = textwrap.wrap(line, width=max(42, width // 15)) or [""]
-        for part in wrapped:
-            draw.text((x, y), part, font=body, fill=WHITE)
-            y += int(height * 0.047)
+        draw.rectangle((0, camera.height - 40, camera.width, camera.height),
+                       fill=(120, 20, 20, 225))
+        draw.text((12, camera.height - 34),
+                  f"EXECUTION FAILED: {str(failure)[:64]}",
+                  font=small_font, fill=WHITE)
     return np.asarray(image)
 
 
-def render_summary_card(width, height, details):
-    image = Image.new("RGB", (width, height), (13, 20, 31))
-    draw = ImageDraw.Draw(image)
-    title = _font(max(30, height // 17), bold=True)
-    body = _font(max(18, height // 34))
-    x = int(width * 0.08)
-    y = int(height * 0.13)
-    draw.text((x, y), "Episode Result", font=title, fill=WHITE)
-    y += int(height * 0.12)
-    fields = [
-        ("Task", details.get("task", "")),
-        ("Success", "YES" if details.get("success") else "NO"),
-        ("Steps executed", details.get("steps", 0)),
-        ("Final reward", details.get("reward", 0.0)),
-        ("Termination", details.get("termination", "unknown")),
-        ("Total Codex latency", f"{details.get('total_latency_seconds', 0.0):.2f} s"),
-        ("Total input tokens", details.get("input_tokens", 0)),
-        ("Total output tokens", details.get("output_tokens", 0)),
-        ("Total reasoning tokens", details.get("reasoning_tokens", 0)),
-    ]
-    for label, value in fields:
-        draw.text((x, y), f"{label}: {value}", font=body, fill=WHITE)
-        y += int(height * 0.075)
-    return np.asarray(image)
+def render_policy_grid(rgb_views, cameras, phase, step_index,
+                       current_xyz=None, target_xyz=None, actual_xyz=None,
+                       target_history=None, panel=None, failure=None):
+    """Compose the four views sent to Luna into one 2x2 video frame."""
+    names = ("front", "left_shoulder", "right_shoulder", "wrist")
+    if tuple(rgb_views) != names or tuple(cameras) != names:
+        raise ValueError("video views must match the four ordered policy cameras")
+    tile_size = cameras["front"].width
+    frame = Image.new("RGB", (tile_size * 2, tile_size * 2), PANEL)
+    placements = {
+        "front": (0, 0),
+        "left_shoulder": (tile_size, 0),
+        "right_shoulder": (0, tile_size),
+        "wrist": (tile_size, tile_size),
+    }
+    for name in names:
+        tile = render_policy_view(
+            rgb_views[name], cameras[name], name, phase, step_index,
+            current_xyz=current_xyz, target_xyz=target_xyz,
+            actual_xyz=actual_xyz, target_history=target_history,
+            panel=panel, failure=failure,
+        )
+        frame.paste(Image.fromarray(tile, mode="RGB"), placements[name])
+    return np.asarray(frame)
