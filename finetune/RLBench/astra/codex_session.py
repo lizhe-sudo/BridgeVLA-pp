@@ -11,6 +11,7 @@ import selectors
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from .errors import (
@@ -23,21 +24,23 @@ from .errors import (
 
 SAFE_ITEM_TYPES = {
     "agentMessage", "reasoning", "plan", "userMessage",
-    "developerMessage", "systemMessage",
+    "developerMessage", "systemMessage", "contextCompaction",
 }
+SAFE_ITEM_DELTA_TYPES = {"agentMessage", "reasoning", "plan"}
 
 
 class CodexAppServerSession:
     """One App Server process and one newly created native thread."""
 
     def __init__(self, executable, cwd, model, reasoning_effort, timeout,
-                 process_factory=subprocess.Popen):
+                 process_factory=subprocess.Popen, monotonic=time.monotonic):
         self.executable = str(executable)
         self.cwd = Path(cwd).resolve()
         self.model = str(model)
         self.reasoning_effort = str(reasoning_effort)
         self.timeout = float(timeout)
         self.process_factory = process_factory
+        self.monotonic = monotonic
         self.process = None
         self.selector = None
         self._stdout_buffer = bytearray()
@@ -49,6 +52,7 @@ class CodexAppServerSession:
         self.resolved_model = None
         self.app_server_info = None
         self.instruction_sources = None
+        self.initialization_latency_seconds = None
         self.failed = False
         self.closed = False
         self.process_group_exit_confirmed = None
@@ -89,6 +93,11 @@ class CodexAppServerSession:
 
     def _read_line(self, deadline):
         while True:
+            if self.monotonic() >= deadline:
+                raise InferenceDeadlineExceeded(
+                    "Codex App Server request exceeded its configured deadline",
+                    error_code="inference_deadline_exceeded",
+                )
             newline = self._stdout_buffer.find(b"\n")
             if newline >= 0:
                 line = bytes(self._stdout_buffer[:newline])
@@ -112,7 +121,7 @@ class CodexAppServerSession:
                     "Codex App Server exited before completing the request",
                     error_code="app_server_exited",
                 )
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self.monotonic()
             if remaining <= 0:
                 raise InferenceDeadlineExceeded(
                     "Codex App Server request exceeded its configured deadline",
@@ -146,15 +155,41 @@ class CodexAppServerSession:
             raise ModelServiceError("failed to write to Codex App Server",
                                     error_code="app_server_write_failed") from exc
 
-    def _request(self, method, params, timeout=None):
+    def _request(self, method, params, timeout=None, deadline=None):
+        if deadline is None:
+            deadline = self.monotonic() + (
+                self.timeout if timeout is None else float(timeout)
+            )
+        if self.monotonic() >= deadline:
+            raise InferenceDeadlineExceeded(
+                "Codex App Server request exceeded its configured deadline",
+                error_code="inference_deadline_exceeded",
+            )
         request_id = self._next_request_id
         self._next_request_id += 1
         self._send({"method": method, "id": request_id, "params": params})
+        if method == "turn/start":
+            self.last_turn_metadata["app_server_rpc_request_id"] = request_id
+            self.last_turn_metadata["turn_start_sent"] = True
         self.rpc_request_count += 1
-        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        if self.monotonic() >= deadline:
+            raise InferenceDeadlineExceeded(
+                "Codex App Server request exceeded its configured deadline",
+                error_code="inference_deadline_exceeded",
+            )
         while True:
+            if self.monotonic() >= deadline:
+                raise InferenceDeadlineExceeded(
+                    "Codex App Server request exceeded its configured deadline",
+                    error_code="inference_deadline_exceeded",
+                )
             message = self._read_line(deadline)
             if message.get("id") == request_id:
+                if self.monotonic() >= deadline:
+                    raise InferenceDeadlineExceeded(
+                        "Codex App Server request exceeded its configured deadline",
+                        error_code="inference_deadline_exceeded",
+                    )
                 if "error" in message:
                     raise self._rpc_error(message["error"],
                                           "app_server_request_failed")
@@ -199,20 +234,26 @@ class CodexAppServerSession:
         if self.failed or self.closed:
             raise ModelServiceError("Codex control session is not usable",
                                     error_code="control_session_unusable")
-        self._initialize()
-        result = self._request("thread/start", {
-            "model": self.model,
-            "allowProviderModelFallback": False,
-            "cwd": str(self.cwd),
-            "runtimeWorkspaceRoots": [],
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
-            "ephemeral": False,
-            "developerInstructions": str(developer_instructions),
-            "dynamicTools": [],
-            "environments": [],
-            "serviceName": "astra_rlbench_eval",
-        })
+        initialized_at = self.monotonic()
+        try:
+            self._initialize()
+            result = self._request("thread/start", {
+                "model": self.model,
+                "allowProviderModelFallback": False,
+                "cwd": str(self.cwd),
+                "runtimeWorkspaceRoots": [],
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "ephemeral": False,
+                "developerInstructions": str(developer_instructions),
+                "dynamicTools": [],
+                "environments": [],
+                "serviceName": "astra_rlbench_eval",
+            })
+        finally:
+            self.initialization_latency_seconds = max(
+                0.0, self.monotonic() - initialized_at
+            )
         thread = result.get("thread")
         if not isinstance(thread, dict):
             self.failed = True
@@ -253,6 +294,7 @@ class CodexAppServerSession:
             "native_session_id": thread.get("sessionId"),
             "ephemeral": thread.get("ephemeral"),
             "thread_start_response_model": model,
+            "initialization_latency_seconds": self.initialization_latency_seconds,
         }
 
     @staticmethod
@@ -270,77 +312,247 @@ class CodexAppServerSession:
         turn_id = turn.get("id") if isinstance(turn, dict) else params.get("turnId")
         return params.get("threadId"), turn_id
 
+    @staticmethod
+    def _event_evidence(message, item=None, stale_duplicate=False):
+        params = message.get("params")
+        params = params if isinstance(params, dict) else {}
+        thread_id, turn_id = CodexAppServerSession._notification_identity(message)
+        if thread_id is None and isinstance(params.get("thread"), dict):
+            thread_id = params["thread"].get("id")
+        if item is None:
+            item = params.get("item")
+        evidence = {"method": message.get("method")}
+        for key, value in (("thread_id", thread_id), ("turn_id", turn_id)):
+            if isinstance(value, str):
+                evidence[key] = value
+        if isinstance(item, dict):
+            item_id = item.get("id")
+            item_type = item.get("type")
+            phase = item.get("phase")
+            if isinstance(item_id, str):
+                evidence["item_id"] = item_id
+            if isinstance(item_type, str):
+                evidence["item_type"] = item_type
+            if phase is None or isinstance(phase, str):
+                evidence["phase"] = phase
+            if item_type == "contextCompaction":
+                evidence["location"] = (
+                    "turn_completed_snapshot"
+                    if message.get("method") == "turn/completed"
+                    else "item_lifecycle"
+                )
+        else:
+            params_item_id = params.get("itemId")
+            if isinstance(params_item_id, str):
+                evidence["item_id"] = params_item_id
+            if message.get("method") == "thread/compacted":
+                evidence["location"] = "legacy_thread_notification"
+        if stale_duplicate:
+            evidence["stale_duplicate"] = True
+        return evidence
+
+    def _append_context_compaction(self, message, item=None, location=None,
+                                   stale_duplicate=False):
+        evidence = self._event_evidence(message, item=item)
+        event = {
+            "protocol_event": evidence.get("method"),
+            "location": location or (
+                "item_lifecycle" if evidence.get("item_type") == "contextCompaction"
+                else "legacy_thread_notification"
+            ),
+        }
+        for source, destination in (
+            ("thread_id", "thread_id"), ("turn_id", "turn_id"),
+            ("item_id", "item_id"),
+        ):
+            value = evidence.get(source)
+            if isinstance(value, str):
+                event[destination] = value
+        if stale_duplicate:
+            event["stale_duplicate"] = True
+        self.context_compression_events.append(event)
+
     def _consume_notifications(self, expected_turn_id, deadline):
         seen_turn_started = False
         completed_turn = None
-        assistant_messages = []
+        completed_messages = {}
         tool_events = []
         event_evidence = []
         pending = self._notifications
         self._notifications = []
+
+        def save_progress():
+            self.last_turn_metadata["event_evidence"] = list(event_evidence)
+            self.last_turn_metadata["tool_call_events"] = list(tool_events)
+            self.last_turn_metadata["tool_call_detected"] = bool(tool_events)
+
+        def fail(message, error_code):
+            save_progress()
+            self.failed = True
+            raise ModelServiceError(message, error_code=error_code)
+
+        def capture_completed_agent(item, source):
+            if not isinstance(item, dict):
+                fail("completed App Server agent message was malformed",
+                     "app_server_turn_protocol_error")
+            item_id = item.get("id")
+            text = item.get("text")
+            phase = item.get("phase")
+            if not isinstance(item_id, str) or not item_id.strip():
+                fail("completed App Server agent message had no item id",
+                     "app_server_turn_protocol_error")
+            if not isinstance(text, str):
+                fail("completed App Server agent message had no text",
+                     "app_server_turn_protocol_error")
+            if phase not in (None, "commentary", "final_answer"):
+                fail("App Server agent message had an unknown phase",
+                     "app_server_message_phase_unknown")
+            prior = completed_messages.get(item_id)
+            if prior is not None and (prior["text"], prior["phase"]) != (text, phase):
+                fail("App Server reused an agent message id with conflicting content or phase",
+                     "conflicting_agent_message_item")
+            if prior is None:
+                completed_messages[item_id] = {
+                    "id": item_id, "text": text, "phase": phase,
+                    "sources": [source],
+                }
+            else:
+                prior["sources"].append(source)
+
+        def selected_final(messages):
+            item_ids = sorted(row["id"] for row in messages)
+            self.last_turn_metadata["final_message_item_ids"] = item_ids
+            self.last_turn_metadata["final_message_candidate_count"] = len(messages)
+            return messages[0]["text"]
+
+        def prior_completed_turn_ids():
+            return {
+                row.get("turn_id") for row in self.turn_records
+                if row.get("turn_id") and row.get("status") == "completed"
+            }
+
+        def is_stale_turn_event(message):
+            thread_id, turn_id = self._notification_identity(message)
+            return (
+                thread_id == self.thread_id
+                and turn_id != expected_turn_id
+                and turn_id in prior_completed_turn_ids()
+            )
+
         while True:
+            if self.monotonic() >= deadline:
+                self._notifications = pending + self._notifications
+                save_progress()
+                raise InferenceDeadlineExceeded(
+                    "Codex App Server control turn exceeded its configured deadline",
+                    error_code="inference_deadline_exceeded",
+                )
             if not pending:
-                pending.append(self._read_line(deadline))
+                try:
+                    pending.append(self._read_line(deadline))
+                except Exception:
+                    self._notifications = pending + self._notifications
+                    save_progress()
+                    raise
             message = pending.pop(0)
             method = message.get("method")
             if not isinstance(method, str):
-                self.failed = True
-                raise ModelServiceError("unexpected App Server message during turn",
-                                        error_code="app_server_turn_protocol_error")
+                event_evidence.append({"method": "unknown"})
+                fail("unexpected App Server message during turn",
+                     "app_server_turn_protocol_error")
             params = message.get("params", {})
             if not isinstance(params, dict):
-                self.failed = True
-                raise ModelServiceError("App Server notification parameters were malformed",
-                                        error_code="app_server_turn_protocol_error")
-            if "compact" in method.lower() or "context" in method.lower():
-                self.context_compression_events.append({
-                    "method": method, "turn_id": expected_turn_id,
-                })
-            event = {"method": method}
+                event_evidence.append(self._event_evidence(message))
+                fail("App Server notification parameters were malformed",
+                     "app_server_turn_protocol_error")
+            if method in ("turn/started", "turn/completed") or method.startswith("item/"):
+                if is_stale_turn_event(message):
+                    stale_item = params.get("item")
+                    if (method.startswith("item/") and isinstance(stale_item, dict)
+                            and stale_item.get("type") == "contextCompaction"):
+                        self._append_context_compaction(
+                            message, item=stale_item, location="stale_turn_item",
+                            stale_duplicate=True,
+                        )
+                    event_evidence.append(self._event_evidence(
+                        message, stale_duplicate=True
+                    ))
+                    continue
             if method in ("thread/started", "thread/updated"):
                 event_thread = params.get("thread", {}).get("id") if isinstance(
                     params.get("thread"), dict) else None
                 if event_thread and event_thread != self.thread_id:
-                    self.failed = True
-                    raise ModelServiceError("App Server thread identity changed",
-                                            error_code="thread_identity_mismatch")
-                event_evidence.append(event)
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server thread identity changed", "thread_identity_mismatch")
+                event_evidence.append(self._event_evidence(message))
+                continue
+            if method == "thread/compacted":
+                event_thread, event_turn = self._notification_identity(message)
+                if event_thread != self.thread_id:
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server context compaction thread identity did not match",
+                         "thread_identity_mismatch")
+                if event_turn != expected_turn_id:
+                    if event_turn in prior_completed_turn_ids():
+                        event_evidence.append(self._event_evidence(
+                            message, stale_duplicate=True
+                        ))
+                        self.context_compression_events.append({
+                            "protocol_event": method, "location": "legacy_thread_notification",
+                            "thread_id": event_thread, "turn_id": event_turn,
+                            "stale_duplicate": True,
+                        })
+                        continue
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server context compaction turn identity did not match",
+                         "turn_identity_mismatch")
+                event_evidence.append(self._event_evidence(message))
+                self._append_context_compaction(message, location="legacy_thread_notification")
                 continue
             if method == "turn/started":
                 event_thread, event_turn = self._notification_identity(message)
                 if event_thread != self.thread_id or event_turn != expected_turn_id:
-                    self.failed = True
-                    raise ModelServiceError("App Server turn identity did not match",
-                                            error_code="turn_identity_mismatch")
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server turn identity did not match", "turn_identity_mismatch")
                 if seen_turn_started:
-                    self.failed = True
-                    raise ModelServiceError("App Server duplicated turn/started",
-                                            error_code="duplicate_turn_event")
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server duplicated turn/started", "duplicate_turn_event")
                 seen_turn_started = True
-                event_evidence.append(event)
+                event_evidence.append(self._event_evidence(message))
                 continue
             if method.startswith("item/"):
                 event_thread, event_turn = self._notification_identity(message)
                 if event_thread != self.thread_id or event_turn != expected_turn_id:
-                    self.failed = True
-                    raise ModelServiceError("App Server item identity did not match",
-                                            error_code="turn_identity_mismatch")
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server item identity did not match", "turn_identity_mismatch")
                 item_type = self._item_type(message)
-                event["item_type"] = item_type if isinstance(item_type, str) else None
+                item = params.get("item")
+                event = self._event_evidence(message, item=item)
+                event_type = item_type
+                if event_type is None and method not in ("item/started", "item/completed"):
+                    parts = method.split("/")
+                    event_type = parts[1] if len(parts) > 1 else None
+                    if isinstance(event_type, str):
+                        event["item_type"] = event_type
                 event_evidence.append(event)
-                method_lower = method.lower()
-                method_names_tool = any(token in method_lower for token in (
-                    "commandexecution", "filechange", "mcptool", "websearch",
-                    "functioncall", "toolcall", "shellcommand",
-                ))
-                if ((item_type is not None and item_type not in SAFE_ITEM_TYPES)
-                        or method_names_tool):
+                if event_type == "contextCompaction":
+                    if (item_type == "contextCompaction"
+                            and method in ("item/started", "item/completed")):
+                        self._append_context_compaction(message, item=item)
+                    else:
+                        tool_events.append(event)
+                elif event_type not in SAFE_ITEM_TYPES:
+                    # Only a protocol-explicit allowlist is safe. Known tools
+                    # and future/unknown item types are retained as evidence
+                    # and rejected once this turn completes.
                     tool_events.append(event)
+                elif method not in ("item/started", "item/completed"):
+                    delta_kind = method.split("/")[-1]
+                    if event_type not in SAFE_ITEM_DELTA_TYPES or delta_kind not in {
+                            "delta", "summaryTextDelta", "summaryPartAdded", "textDelta"}:
+                        tool_events.append(event)
                 if method == "item/completed" and item_type == "agentMessage":
-                    item = params.get("item")
-                    text = item.get("text") if isinstance(item, dict) else None
-                    if isinstance(text, str):
-                        assistant_messages.append(text)
+                    capture_completed_agent(item, "item/completed")
                 continue
             if method == "turn/completed":
                 event_thread, event_turn = self._notification_identity(message)
@@ -349,44 +561,66 @@ class CodexAppServerSession:
                     # candidates for this action; future/unknown turns fail closed.
                     if event_thread == self.thread_id and event_turn in {
                             row.get("turn_id") for row in self.turn_records}:
-                        event_evidence.append({"method": method, "stale_duplicate": True})
+                        event_evidence.append(self._event_evidence(
+                            message, stale_duplicate=True
+                        ))
                         continue
-                    self.failed = True
-                    raise ModelServiceError("App Server completion identity did not match",
-                                            error_code="turn_identity_mismatch")
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server completion identity did not match",
+                         "turn_identity_mismatch")
                 turn = params.get("turn")
                 if not isinstance(turn, dict):
-                    self.failed = True
-                    raise ModelServiceError("App Server completion had no turn object",
-                                            error_code="app_server_turn_protocol_error")
+                    event_evidence.append(self._event_evidence(message))
+                    fail("App Server completion had no turn object",
+                         "app_server_turn_protocol_error")
                 if completed_turn is not None:
                     # Repeated completion for this same turn is evidence of an
                     # ambiguous response. Never parse/execute it twice.
-                    self.failed = True
-                    raise ModelServiceError("App Server duplicated turn/completed",
-                                            error_code="duplicate_turn_event")
+                    fail("App Server duplicated turn/completed", "duplicate_turn_event")
                 completed_turn = turn
+                turn_status = turn.get("status")
+                if turn_status not in ("completed", "interrupted", "failed"):
+                    event_evidence.append(self._event_evidence(message))
+                    self.last_turn_metadata["turn_end_confirmed"] = False
+                    self.last_turn_metadata["turn_end_state"] = "unknown"
+                    fail("Codex control turn completion had an unknown status",
+                         "control_turn_status_unknown")
+                self.last_turn_metadata["turn_end_confirmed"] = True
+                self.last_turn_metadata["turn_end_state"] = turn_status
+                if turn_status != "completed":
+                    event_evidence.append(self._event_evidence(message))
+                    fail("Codex control turn did not complete successfully",
+                         "control_turn_not_completed")
+                event_evidence.append(self._event_evidence(message))
                 items = turn.get("items")
                 if isinstance(items, list):
                     for item in items:
-                        if isinstance(item, dict) and item.get("type") == "agentMessage":
-                            text = item.get("text")
-                            if isinstance(text, str):
-                                assistant_messages.append(text)
-                if turn.get("status") != "completed":
-                    self.failed = True
-                    raise ModelServiceError(
-                        "Codex control turn did not complete successfully",
-                        error_code="control_turn_not_completed",
-                    )
+                        if not isinstance(item, dict):
+                            tool_events.append({
+                                "method": "turn/completed_snapshot",
+                                "thread_id": self.thread_id,
+                                "turn_id": expected_turn_id,
+                                "item_type": None,
+                            })
+                            continue
+                        snapshot_type = item.get("type")
+                        if snapshot_type == "agentMessage":
+                            capture_completed_agent(item, "turn/completed_snapshot")
+                        elif snapshot_type == "contextCompaction":
+                            self._append_context_compaction(
+                                message, item=item,
+                                location="turn_completed_snapshot",
+                            )
+                        elif snapshot_type not in SAFE_ITEM_TYPES:
+                            tool_events.append(self._event_evidence(
+                                message, item=item
+                            ))
                 break
             if "id" in message:
-                self.failed = True
-                raise ModelServiceError(
-                    "unexpected App Server request during a control turn",
-                    error_code="unexpected_app_server_request",
-                )
-            event_evidence.append(event)
+                event_evidence.append(self._event_evidence(message))
+                fail("unexpected App Server request during a control turn",
+                     "unexpected_app_server_request")
+            event_evidence.append(self._event_evidence(message))
 
         # Check already-buffered notifications for a duplicate completion for
         # this turn before accepting its one final message.
@@ -395,9 +629,8 @@ class CodexAppServerSession:
             if (message.get("method") == "turn/completed"
                     and self._notification_identity(message) ==
                     (self.thread_id, expected_turn_id)):
-                self.failed = True
-                raise ModelServiceError("App Server duplicated turn/completed",
-                                        error_code="duplicate_turn_event")
+                event_evidence.append(self._event_evidence(message))
+                fail("App Server duplicated turn/completed", "duplicate_turn_event")
             still_pending.append(message)
         self._notifications = still_pending
 
@@ -405,129 +638,255 @@ class CodexAppServerSession:
             self.failed = True
             return None, tool_events, event_evidence, seen_turn_started
         if not seen_turn_started:
-            self.failed = True
-            raise ModelServiceError("App Server omitted turn/started identity evidence",
-                                    error_code="turn_start_unconfirmed")
-        if not assistant_messages:
-            self.failed = True
-            raise ModelServiceError("completed App Server turn had no final assistant message",
-                                    error_code="missing_final_message")
-        return assistant_messages[-1], tool_events, event_evidence, seen_turn_started
+            fail("App Server omitted turn/started identity evidence",
+                 "turn_start_unconfirmed")
+
+        explicit_final = [row for row in completed_messages.values()
+                          if row["phase"] == "final_answer"]
+        if explicit_final:
+            unique_texts = {row["text"] for row in explicit_final}
+            if len(unique_texts) > 1:
+                fail("completed App Server turn had conflicting final messages",
+                     "conflicting_final_messages")
+            return (selected_final(explicit_final), tool_events, event_evidence,
+                    seen_turn_started)
+
+        # The installed schema marks phase as optional/null for providers that
+        # do not emit it consistently. Compatibility is limited to one unique
+        # completed agentMessage, and only when no explicit commentary exists;
+        # this fallback is applied after the matching turn/completed event.
+        unknown_phase = [row for row in completed_messages.values()
+                         if row["phase"] is None]
+        has_commentary = any(row["phase"] == "commentary"
+                             for row in completed_messages.values())
+        if len(unknown_phase) == 1 and not has_commentary:
+            self.last_turn_metadata["phase_compatibility"] = (
+                "single_completed_unknown_phase_message_no_commentary"
+            )
+            return (selected_final(unknown_phase), tool_events, event_evidence,
+                    seen_turn_started)
+        if not completed_messages or (not explicit_final and not unknown_phase):
+            fail("completed App Server turn had no final assistant message",
+                 "missing_final_message")
+        fail("App Server final message phase was ambiguous",
+             "ambiguous_final_message_phase")
 
     def _interrupt_after_timeout(self, turn_id):
+        cleanup_started = self.monotonic()
         confirmed = False
-        try:
-            self._request("turn/interrupt", {
-                "threadId": self.thread_id, "turnId": turn_id,
-            }, timeout=2.0)
-            queued = self._notifications
-            self._notifications = []
-            for message in queued:
-                if message.get("method") == "turn/completed":
-                    thread_id, completed_id = self._notification_identity(message)
-                    if thread_id == self.thread_id and completed_id == turn_id:
-                        status = message.get("params", {}).get("turn", {}).get("status")
-                        confirmed = status in ("interrupted", "failed", "completed")
-                        if confirmed:
-                            break
+        interrupt_acknowledged = False
+
+        def consume_end_event(message):
+            nonlocal confirmed
+            if message.get("method") != "turn/completed":
+                return False
+            thread_id, completed_id = self._notification_identity(message)
+            if thread_id != self.thread_id or completed_id != turn_id:
+                return False
+            turn = message.get("params", {}).get("turn")
+            status = turn.get("status") if isinstance(turn, dict) else None
+            if status in ("interrupted", "failed", "completed"):
+                confirmed = True
+                self.last_turn_metadata["turn_end_state"] = status
+            return True
+
+        queued = self._notifications
+        self._notifications = []
+        for message in queued:
+            if not consume_end_event(message):
                 self._notifications.append(message)
-            deadline = time.monotonic() + 2.0
-            while not confirmed and time.monotonic() < deadline:
+        if not confirmed:
+            try:
+                self._request("turn/interrupt", {
+                    "threadId": self.thread_id, "turnId": turn_id,
+                }, timeout=2.0)
+                interrupt_acknowledged = True
+            except Exception:
+                # An RPC acknowledgement is useful evidence, but only the matching
+                # turn/completed notification confirms that the remote turn ended.
+                pass
+        queued = self._notifications
+        self._notifications = []
+        for message in queued:
+            if not consume_end_event(message):
+                self._notifications.append(message)
+        deadline = self.monotonic() + 2.0
+        while not confirmed and self.monotonic() < deadline:
+            try:
                 message = self._read_line(deadline)
-                if message.get("method") == "turn/completed":
-                    thread_id, completed_id = self._notification_identity(message)
-                    if thread_id == self.thread_id and completed_id == turn_id:
-                        status = message.get("params", {}).get("turn", {}).get("status")
-                        confirmed = status in ("interrupted", "failed", "completed")
-                        break
-                elif message.get("method"):
-                    self._notifications.append(message)
-        except Exception:
-            confirmed = False
+            except Exception:
+                break
+            if not consume_end_event(message) and message.get("method"):
+                self._notifications.append(message)
         self.last_turn_metadata["turn_end_confirmed"] = confirmed
+        self.last_turn_metadata["turn_end_state"] = (
+            self.last_turn_metadata.get("turn_end_state") if confirmed else "unknown"
+        )
+        self.last_turn_metadata["interrupt_acknowledged"] = interrupt_acknowledged
+        self.last_turn_metadata["interrupt_completion_event"] = (
+            {"thread_id": self.thread_id, "turn_id": turn_id,
+             "status": self.last_turn_metadata.get("turn_end_state")}
+            if confirmed else None
+        )
+        self.last_turn_metadata["interrupt_cleanup_seconds"] = max(
+            0.0, self.monotonic() - cleanup_started
+        )
         if not confirmed:
             self.failed = True
+            process_cleanup_started = self.monotonic()
             self.close(force=True)
+            self.last_turn_metadata["process_cleanup_seconds"] = max(
+                0.0, self.monotonic() - process_cleanup_started
+            )
+        self.last_turn_metadata["process_group_exit_confirmed"] = (
+            self.process_group_exit_confirmed
+        )
 
-    def run_turn(self, text, image_paths, output_schema):
-        if self.failed or self.closed or not self.thread_id:
-            raise ModelServiceError("Codex control thread is not usable",
-                                    error_code="control_session_unusable")
-        if set(image_paths) != {"front", "left_shoulder", "right_shoulder", "wrist"}:
-            self.failed = True
-            raise ModelServiceError("control turn requires exactly four named images",
-                                    error_code="invalid_control_images")
-        input_items = [{"type": "text", "text": str(text)}]
-        for camera in ("front", "left_shoulder", "right_shoulder", "wrist"):
-            path = Path(image_paths[camera]).resolve()
-            if not path.is_file():
-                self.failed = True
-                raise ModelServiceError(f"control image is missing: {camera}",
-                                        error_code="control_image_missing")
-            input_items.append({"type": "localImage", "path": str(path)})
-
-        started = time.monotonic()
-        result = self._request("turn/start", {
-            "threadId": self.thread_id,
-            "input": input_items,
-            "cwd": str(self.cwd),
-            "model": self.model,
-            "effort": self.reasoning_effort,
-            "approvalPolicy": "never",
-            "outputSchema": output_schema,
+    def _record_turn(self, status):
+        request_id = self.last_turn_metadata.get("control_request_id")
+        if any(row.get("control_request_id") == request_id for row in self.turn_records):
+            return
+        self.turn_records.append({
+            **self.last_turn_metadata,
+            "status": status,
+            "tool_call_detected": bool(
+                self.last_turn_metadata.get("tool_call_detected", False)
+            ),
         })
-        turn = result.get("turn")
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-        if not isinstance(turn_id, str) or not turn_id.strip():
-            self.failed = True
-            raise ModelServiceError("turn/start did not return a turn id",
-                                    error_code="turn_identity_missing")
-        self.turn_count += 1
+
+    def run_turn(self, text, image_paths, output_schema, request_identity=None):
+        started = self.monotonic()
+        deadline = started + self.timeout
+        control_request_id = uuid.uuid4().hex
+        identity = {
+            key: (request_identity or {}).get(key)
+            for key in ("step_id", "action_id", "observation_id")
+        }
+        # Replace metadata before validation or I/O so an early failure cannot
+        # inherit a completed prior turn's IDs, events, or latency.
         self.last_turn_metadata = {
             "thread_id": self.thread_id,
             "session_id": self.session_id,
-            "turn_id": turn_id,
-            "turn_start_status": turn.get("status"),
+            "turn_id": None,
+            "control_request_id": control_request_id,
+            "request_identity": identity,
+            "turn_start_attempted": False,
+            "turn_start_sent": False,
+            "app_server_rpc_request_id": None,
             "turn_end_confirmed": False,
+            "turn_end_state": "unknown",
+            "turn_started_confirmed": False,
+            "tool_call_detected": False,
+            "event_evidence": [],
+            "tool_call_events": [],
+            "phase_compatibility": None,
         }
+        turn_start_submitted = False
         try:
-            final_text, tool_events, events, turn_started = self._consume_notifications(
-                turn_id, time.monotonic() + self.timeout
-            )
-        except InferenceDeadlineExceeded:
-            self._interrupt_after_timeout(turn_id)
-            self.failed = True
-            self.turn_records.append({
-                **self.last_turn_metadata,
-                "status": "timeout",
-                "tool_call_detected": False,
-                "latency_seconds": time.monotonic() - started,
+            if self.failed or self.closed or not self.thread_id:
+                raise ModelServiceError("Codex control thread is not usable",
+                                        error_code="control_session_unusable")
+            if not isinstance(image_paths, dict) or set(image_paths) != {
+                    "front", "left_shoulder", "right_shoulder", "wrist"}:
+                raise ModelServiceError("control turn requires exactly four named images",
+                                        error_code="invalid_control_images")
+            input_items = [{"type": "text", "text": str(text)}]
+            for camera in ("front", "left_shoulder", "right_shoulder", "wrist"):
+                path = Path(image_paths[camera]).resolve()
+                if not path.is_file():
+                    raise ModelServiceError(f"control image is missing: {camera}",
+                                            error_code="control_image_missing")
+                input_items.append({"type": "localImage", "path": str(path)})
+
+            self.last_turn_metadata["turn_start_attempted"] = True
+            turn_start_submitted = True
+            result = self._request("turn/start", {
+                "threadId": self.thread_id,
+                "input": input_items,
+                "cwd": str(self.cwd),
+                "model": self.model,
+                "effort": self.reasoning_effort,
+                "approvalPolicy": "never",
+                "outputSchema": output_schema,
+            }, deadline=deadline)
+            turn = result.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(turn_id, str) or not turn_id.strip():
+                raise ModelServiceError("turn/start did not return a turn id",
+                                        error_code="turn_identity_missing")
+            if any(row.get("turn_id") == turn_id for row in self.turn_records):
+                raise ModelServiceError("turn/start reused a prior turn id",
+                                        error_code="turn_identity_reused")
+            self.last_turn_metadata.update({
+                "turn_id": turn_id,
+                "turn_start_status": turn.get("status"),
             })
-            raise InferenceDeadlineExceeded(
-                "Codex App Server control turn exceeded its configured timeout",
-                error_code="inference_deadline_exceeded",
+            self.turn_count += 1
+            final_text, tool_events, events, turn_started = self._consume_notifications(
+                turn_id, deadline
             )
+            self.last_turn_metadata.update({
+                "turn_end_confirmed": True,
+                "turn_end_state": "completed",
+                "turn_started_confirmed": turn_started,
+                "tool_call_detected": bool(tool_events),
+                "tool_call_events": tool_events,
+                "event_evidence": events,
+                "latency_seconds": max(0.0, self.monotonic() - started),
+            })
+            self._record_turn("rejected" if tool_events else "completed")
+            if tool_events:
+                raise PolicyToolViolation(
+                    "Codex control turn used an App Server tool or unknown item type; "
+                    "the episode session is closed",
+                    error_code="tool_event_detected",
+                )
+            return final_text, dict(self.last_turn_metadata)
+        except InferenceDeadlineExceeded as exc:
+            turn_elapsed = max(0.0, self.monotonic() - started)
+            if self.last_turn_metadata.get("turn_id"):
+                self._interrupt_after_timeout(self.last_turn_metadata["turn_id"])
+            else:
+                self.last_turn_metadata["turn_end_confirmed"] = False
+                self.last_turn_metadata["turn_end_state"] = "unknown"
+                if turn_start_submitted:
+                    process_cleanup_started = self.monotonic()
+                    self.close(force=True)
+                    self.last_turn_metadata["process_cleanup_seconds"] = max(
+                        0.0, self.monotonic() - process_cleanup_started
+                    )
+                    self.last_turn_metadata["process_group_exit_confirmed"] = (
+                        self.process_group_exit_confirmed
+                    )
+            self.failed = True
+            self.last_turn_metadata.update({
+                "status": "timeout",
+                "latency_seconds": turn_elapsed,
+            })
+            self._record_turn("timeout")
+            raise InferenceDeadlineExceeded(
+                "Codex App Server control turn exceeded its configured deadline",
+                error_code="inference_deadline_exceeded",
+            ) from exc
         except Exception:
             self.failed = True
+            turn_elapsed = max(0.0, self.monotonic() - started)
+            if turn_start_submitted and not self.last_turn_metadata.get("turn_end_confirmed"):
+                # Until an end event is confirmed, the local controller will
+                # never accept late output from this process/session.
+                self.last_turn_metadata["turn_end_state"] = "unknown"
+                process_cleanup_started = self.monotonic()
+                self.close(force=True)
+                self.last_turn_metadata["process_cleanup_seconds"] = max(
+                    0.0, self.monotonic() - process_cleanup_started
+                )
+                self.last_turn_metadata["process_group_exit_confirmed"] = (
+                    self.process_group_exit_confirmed
+                )
+            self.last_turn_metadata.setdefault("status", "failed")
+            self.last_turn_metadata.setdefault("latency_seconds", turn_elapsed)
+            self._record_turn(self.last_turn_metadata["status"])
             raise
-        self.last_turn_metadata["turn_end_confirmed"] = True
-        self.last_turn_metadata["turn_started_confirmed"] = turn_started
-        self.last_turn_metadata["tool_call_detected"] = bool(tool_events)
-        self.last_turn_metadata["tool_call_events"] = tool_events
-        self.last_turn_metadata["event_evidence"] = events
-        self.last_turn_metadata["latency_seconds"] = time.monotonic() - started
-        self.turn_records.append({
-            **{key: value for key, value in self.last_turn_metadata.items()
-               if key not in ("event_evidence", "tool_call_events")},
-            "status": "completed",
-            "tool_call_detected": bool(tool_events),
-        })
-        if tool_events:
-            raise PolicyToolViolation(
-                "Codex control turn used an App Server tool; the episode session is closed",
-                error_code="tool_event_detected",
-            )
-        return final_text, dict(self.last_turn_metadata)
 
     def close(self, force=False):
         if self.closed:

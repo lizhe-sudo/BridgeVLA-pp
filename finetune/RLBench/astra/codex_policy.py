@@ -44,12 +44,13 @@ class CodexAstraPolicy(AstraPolicy):
 
     IMAGE_FIELDS = ("front", "left_shoulder", "right_shoulder", "wrist")
     SAFE_ITEM_TYPES = {
-        "agent_message",
+        "agentMessage",
         "reasoning",
         "plan",
-        "user_message",
-        "developer_message",
-        "system_message",
+        "userMessage",
+        "developerMessage",
+        "systemMessage",
+        "contextCompaction",
     }
     TOOL_EVENT_TYPES = {
         "command_execution",
@@ -193,6 +194,10 @@ class CodexAstraPolicy(AstraPolicy):
             ),
             "reasoning_effort": self.reasoning_effort,
             "created_at": self._session_started_at,
+            "initialization_latency_seconds": (
+                self._session.initialization_latency_seconds
+                if self._session is not None else None
+            ),
             "status": status,
             "session_creation_count": int(
                 self._session is not None and self._session.thread_id is not None
@@ -247,19 +252,57 @@ class CodexAstraPolicy(AstraPolicy):
         if self._session is None:
             return
         turn_id = turn_metadata.get("turn_id")
+        request_identity = turn_metadata.get("request_identity") or {}
+        expected_identity = {
+            "step_id": step_id,
+            "action_id": action_id,
+            "observation_id": observation_id,
+        }
+        if request_identity != expected_identity:
+            raise ModelServiceError(
+                "Codex turn metadata did not match the active application action",
+                error_code="control_request_identity_mismatch",
+            )
+        control_request_id = turn_metadata.get("control_request_id")
+        if not isinstance(control_request_id, str) or not control_request_id:
+            raise ModelServiceError(
+                "Codex turn metadata had no application request identity",
+                error_code="control_request_identity_missing",
+            )
         binding = {
+            "control_request_id": control_request_id,
             "step_id": step_id,
             "observation_id": observation_id,
             "action_id": action_id,
             "turn_id": turn_id,
             "status": status,
         }
-        if (self._session.turn_records
-                and self._session.turn_records[-1].get("turn_id") == turn_id
-                and turn_id is not None):
-            self._session.turn_records[-1].update(binding)
-        else:
-            self._session.turn_records.append(binding)
+        matches = [row for row in self._session.turn_records
+                   if row.get("control_request_id") == control_request_id]
+        if len(matches) > 1:
+            raise ModelServiceError(
+                "Codex control request identity was recorded more than once",
+                error_code="duplicate_control_request_record",
+            )
+        if not matches:
+            # This request failed before the session could persist a turn
+            # record. Keep the failure attached to its own null-ID request.
+            self._session.turn_records.append({
+                **binding,
+                "thread_id": self._session.thread_id,
+                "session_id": self._session.session_id,
+                "turn_end_confirmed": False,
+                "turn_end_state": "unknown",
+                "request_identity": expected_identity,
+            })
+            return
+        record = matches[0]
+        if record.get("turn_id") != turn_id:
+            raise ModelServiceError(
+                "Codex control request record turn id changed during binding",
+                error_code="control_turn_record_mismatch",
+            )
+        record.update(binding)
 
     def end_episode(self, termination_reason="episode_finished"):
         """Release this episode's App Server process and finalize its manifest."""
@@ -391,7 +434,7 @@ class CodexAstraPolicy(AstraPolicy):
 
     @classmethod
     def _safe_event_log(cls, event_text):
-        """Persist event types and numeric usage, never arbitrary payloads."""
+        """Persist protocol identity and event types, never arbitrary payloads."""
         records = []
         lines = event_text.splitlines()
         max_lines = 512
@@ -410,6 +453,15 @@ class CodexAstraPolicy(AstraPolicy):
                 "line": line_number,
                 "type": cls._safe_event_type(event.get("type", "unknown")),
             }
+            for key in ("thread_id", "turn_id", "item_id", "location"):
+                value = event.get(key)
+                if isinstance(value, str) and len(value) <= 256:
+                    record[key] = value
+            phase = event.get("phase")
+            if phase in (None, "commentary", "final_answer"):
+                record["phase"] = phase
+            if event.get("stale_duplicate") is True:
+                record["stale_duplicate"] = True
             item = event.get("item")
             if isinstance(item, dict):
                 record["item_type"] = cls._safe_event_type(item.get("type", "unknown"))
@@ -430,10 +482,30 @@ class CodexAstraPolicy(AstraPolicy):
     def _safe_event_type(value):
         value = str(value or "")
         if len(value) > 80 or any(
-            not (char.isalnum() or char in "_.-") for char in value
+            not (char.isalnum() or char in "_./-") for char in value
         ):
             return "unrecognized"
         return value or "unknown"
+
+    @staticmethod
+    def _event_evidence_text(events):
+        lines = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            row = {"type": event.get("method", "unknown")}
+            for key in ("thread_id", "turn_id", "item_id", "location"):
+                value = event.get(key)
+                if isinstance(value, str):
+                    row[key] = value
+            if isinstance(event.get("item_type"), str):
+                row["item"] = {"type": event["item_type"]}
+            if event.get("phase") in (None, "commentary", "final_answer"):
+                row["phase"] = event.get("phase")
+            if event.get("stale_duplicate") is True:
+                row["stale_duplicate"] = True
+            lines.append(json.dumps(row, ensure_ascii=False))
+        return "".join(line + "\n" for line in lines)
 
     @staticmethod
     def _token_usage(event_text):
@@ -972,6 +1044,9 @@ class CodexAstraPolicy(AstraPolicy):
                 "control_session_id": thread_identity["session_id"],
                 "resolved_model": thread_identity["resolved_model"],
                 "app_server_info": thread_identity["app_server_info"],
+                "app_server_initialization_latency_seconds": (
+                    thread_identity["initialization_latency_seconds"]
+                ),
                 "thread_instruction_sources": thread_identity["instruction_sources"],
                 "app_server_session_create_count": 1,
                 "app_server_process_count": 1,
@@ -1020,7 +1095,12 @@ class CodexAstraPolicy(AstraPolicy):
         )
         try:
             final_text, turn_metadata = self._session.run_turn(
-                prompt, image_paths, self._schema_for_mode(self.collision_mode)
+                prompt, image_paths, self._schema_for_mode(self.collision_mode),
+                request_identity={
+                    "step_id": step_id,
+                    "action_id": action_id,
+                    "observation_id": observation_id,
+                },
             )
             self._bind_session_turn(
                 step_id, action_id, observation_id, turn_metadata, "completed"
@@ -1040,15 +1120,14 @@ class CodexAstraPolicy(AstraPolicy):
                 "app_server_request_count": (
                     self._session.rpc_request_count - request_count_before
                 ),
-                "latency_seconds": time.monotonic() - started,
+                "latency_seconds": (
+                    turn_metadata.get("latency_seconds")
+                    if turn_metadata.get("latency_seconds") is not None
+                    else time.monotonic() - started
+                ),
             })
-            event_text = "".join(
-                json.dumps({
-                    "type": event.get("method", "unknown"),
-                    **({"item": {"type": event["item_type"]}}
-                       if event.get("item_type") is not None else {}),
-                }) + "\n"
-                for event in turn_metadata.get("event_evidence", [])
+            event_text = self._event_evidence_text(
+                turn_metadata.get("event_evidence", [])
             )
             self._write_event_evidence(events_path, event_text, metadata)
             self._write_session_manifest("failed")
@@ -1080,13 +1159,8 @@ class CodexAstraPolicy(AstraPolicy):
             "model_output_byte_length": len(final_text.encode("utf-8")),
         })
         self._transient_final_text = final_text
-        event_text = "".join(
-            json.dumps({
-                "type": event.get("method", "unknown"),
-                **({"item": {"type": event["item_type"]}}
-                   if event.get("item_type") is not None else {}),
-            }) + "\n"
-            for event in turn_metadata.get("event_evidence", [])
+        event_text = self._event_evidence_text(
+            turn_metadata.get("event_evidence", [])
         )
         self._write_event_evidence(events_path, event_text, metadata)
         self._write_session_manifest("active")

@@ -89,7 +89,24 @@ non-ephemeral native thread with `thread/start`, and requires both the returned
 manifest before returning the first action. Every policy decision sends a new
 `turn/start` to that same thread, with the current text, four ordered
 `localImage` inputs, model, reasoning effort, and a fresh action schema. It
-accepts only the final agent message after a matching `turn/completed` event.
+accepts only a completed `agentMessage` with `phase: final_answer` after a
+matching `turn/completed` event. Commentary and streaming deltas are never
+action candidates. A repeated item ID is deduplicated across item completion
+and the completed-turn snapshot; conflicting content or phase, or distinct
+conflicting final messages, fails the turn. The installed App Server schema
+allows a null/omitted phase for provider compatibility. Astra accepts that
+legacy form only when the completed turn has exactly one unique phase-unknown
+agent message and no explicit commentary, and records that fallback in the
+turn metadata; ambiguous phase-less output is rejected.
+
+One absolute monotonic deadline covers each control request from `turn/start`
+write through its start response and matching completion event. Thread/App
+Server initialization time is recorded separately. If startup times out before
+a turn ID is confirmed, Astra does not interrupt a previous turn ID; it closes
+the episode-owned App Server process group and records the end state as
+unknown. After a confirmed turn timeout, an interrupt acknowledgement alone
+does not count as cancellation: Astra waits for the matching `turn/completed`
+event. A timed-out or otherwise unconfirmed turn cannot yield a late action.
 The CLI resume path was not selected: local `codex exec resume --help` did not
 provide the verified JSON, image, and structured-output flow required here.
 
@@ -99,19 +116,29 @@ binding and pending feedback. The app never uses `--last`, guesses a session,
 resumes the development thread, or creates a replacement thread after a
 control-turn error. It checks the returned instruction sources are empty and
 sets read-only sandboxing, no approvals, and no dynamic tools. A detected tool
-item or protocol/identity error fails the episode closed. This is a narrow
-verified boundary, not a claim of complete isolation from all user-level or
-service-added context. The user's global Codex configuration is not changed.
+item or unknown item type fails the episode closed. Protocol-defined
+`contextCompaction` items are recorded by thread, turn, item, and lifecycle
+location and do not yield actions; the locally generated schema also exposes
+the deprecated `thread/compacted` notification, which is recorded when seen.
+Tool items remain rejected even in a turn that also compacts context. This is a
+narrow verified boundary, not a claim of complete isolation from all user-level
+or service-added context. The user's global Codex configuration is not changed.
 
 The first prompt contains the control rules, task instruction, measured pose,
 gripper state, step/budget, and the initial four images. Later turns add only
 the latest four images and measured feedback for the immediately previous
-action. Feedback is bound by `step_id` and `action_id`; the next request is not
-sent until the prior environment call and feedback record finish. Old images
+action. Feedback is bound by `step_id`, `action_id`, and observation identity;
+each turn record also has its own application control-request ID, distinct from
+thread, turn, and action IDs. A failed new `turn/start` retains a null turn ID
+and cannot rewrite a prior turn record. The next request is not sent until the
+prior environment call and feedback record finish. Old images
 and prompts are not replayed by the application. Native conversation history
 is separate from `control_messages.jsonl`, which records the exact app-added
 text/image references, final structured action, and allowlisted measured
-feedback. It does not copy hidden reasoning or the native rollout. App Server
+feedback. Feedback preserves the model-requested quaternion from adapter
+diagnostics, the normalized quaternion submitted to RLBench, and the measured
+before/after orientations as separate values; a missing requested field is a
+diagnostic error. It does not copy hidden reasoning or the native rollout. App Server
 history may be compacted; compression events are recorded when observed, and
 otherwise the manifest leaves that information unknown. Native history does
 not prove that every earlier image remains available to the model.
