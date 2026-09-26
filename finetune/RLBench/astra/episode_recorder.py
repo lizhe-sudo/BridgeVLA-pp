@@ -185,13 +185,17 @@ class PolicyCameraRig:
 class EpisodeRecorder:
     def __init__(self, output_root, task, episode, instruction="",
                  model="gpt-6-luna", reasoning="max", record_video=True,
-                 view_size=512, fps=20):
+                 view_size=512, fps=20, policy_type="mock",
+                 collision_mode="fixed0", run_context=None):
         self.output_root = Path(output_root).expanduser().absolute()
         self.task = str(task)
         self.episode = int(episode)
         self.instruction = str(instruction or "")
         self.model = str(model)
         self.reasoning = str(reasoning)
+        self.policy_type = str(policy_type)
+        self.collision_mode = str(collision_mode)
+        self.run_context = dict(run_context or {})
         self.record_video = bool(record_video)
         self.view_size = int(view_size)
         self.fps = int(fps)
@@ -214,6 +218,12 @@ class EpisodeRecorder:
         self._frame_index = 0
         self._video_duration = 0.0
         self._next_video_time = 0.0
+        self.simulation_step_count = 0
+        self.simulation_time_seconds = 0.0
+        self.recording_error = None
+        self.recording_status = "pending" if self.record_video else "disabled"
+        self.summary_path = self.run_dir / "episode_summary.json"
+        self._episode_summary = None
         self._last_step = None
         self._target_history = []
         self._run_meta = {
@@ -223,7 +233,17 @@ class EpisodeRecorder:
             "episode": self.episode,
             "instruction": self.instruction,
             "model": self.model,
+            "experiment_name": "Astra-Direct-RGB",
+            "policy_type": self.policy_type,
+            "requested_model": self.model if self.policy_type == "codex_cli" else None,
+            "resolved_model": None,
+            "codex_cli_version": None,
             "reasoning_effort": self.reasoning,
+            "collision_mode": self.collision_mode,
+            "collision_action_space_matches_predictive_baseline": (
+                self.collision_mode == "predict"
+            ),
+            **self.run_context,
             "policy_input_cameras": list(POLICY_CAMERAS),
             "recording_views_match_policy_inputs": True,
             "video_composite_passed_to_policy": False,
@@ -237,6 +257,10 @@ class EpisodeRecorder:
             "video_resolution": [self.video_width, self.video_height],
             "steps": 0,
             "success": False,
+            "simulation_step_count": 0,
+            "simulation_time_seconds": 0.0,
+            "recording_status": self.recording_status,
+            "recording_error": None,
         }
         _write_json(self.run_dir / "run_meta.json", self._run_meta)
 
@@ -254,6 +278,23 @@ class EpisodeRecorder:
     def initialize_camera(self, scene, raw_observation=None):
         if not self.record_video:
             return
+        try:
+            self._initialize_camera(scene, raw_observation)
+        except Exception as exc:
+            self._set_recording_error(exc)
+            self._camera_rig = None
+
+    def _set_recording_error(self, exc):
+        if isinstance(exc, BaseException):
+            message = f"{type(exc).__name__}: {exc}"
+        else:
+            message = str(exc)
+        self.recording_error = self.recording_error or message
+        self.recording_status = "failed"
+        self._run_meta["recording_status"] = self.recording_status
+        self._run_meta["recording_error"] = self.recording_error
+
+    def _initialize_camera(self, scene, raw_observation=None):
         self._camera_rig = PolicyCameraRig(scene, self.view_size)
         self._run_meta["recording_views"] = self._camera_rig.metadata()
         _write_json(self.run_dir / "run_meta.json", self._run_meta)
@@ -274,11 +315,15 @@ class EpisodeRecorder:
         ready_path = self._save_video_frame(ready)
         self._video_frame_paths.extend([ready_path] * (2 * self.fps))
         self._video_duration += 2.0
+        self.recording_status = "recording"
 
     def set_instruction(self, instruction):
         self.instruction = str(instruction or "")
         self._run_meta["instruction"] = self.instruction
-        _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        try:
+            _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        except Exception as exc:
+            self._set_recording_error(exc)
 
     @staticmethod
     def _observation_pose(observation):
@@ -312,6 +357,16 @@ class EpisodeRecorder:
     def _save_policy_artifacts(self, step_dir, policy_metadata):
         codex_dir = step_dir
         metadata = policy_metadata if isinstance(policy_metadata, dict) else {}
+        if self.policy_type != "codex_cli":
+            _write_json(codex_dir / "policy_metadata.json", {
+                "policy_type": self.policy_type,
+                "requested_model": None,
+                "resolved_model": None,
+                "codex_cli_version": None,
+                "reasoning_effort": None,
+                "service_call": "not_applicable",
+            })
+            return
         self._copy_or_write(metadata.get("prompt_path"), codex_dir / "prompt.txt",
                             metadata.get("prompt", ""))
         schema_source = None
@@ -321,7 +376,10 @@ class EpisodeRecorder:
                 schema_source = str(candidate)
         if schema_source is None:
             from .codex_policy import CodexAstraPolicy
-            _write_json(codex_dir / "action_schema.json", CodexAstraPolicy._schema())
+            _write_json(
+                codex_dir / "action_schema.json",
+                CodexAstraPolicy._schema_for_mode(self.collision_mode),
+            )
         else:
             self._copy_or_write(schema_source, codex_dir / "action_schema.json")
         self._copy_or_write(metadata.get("action_json_path"),
@@ -409,36 +467,11 @@ class EpisodeRecorder:
     def begin_step(self, step, raw_observation, action=None,
                    final_action=None, policy_metadata=None):
         step_dir = self.steps_dir / f"step_{int(step):03d}"
-        step_dir.mkdir(parents=True, exist_ok=False)
-        self._save_policy_images(raw_observation, step_dir / "observation_before")
-        self._save_policy_artifacts(step_dir, policy_metadata)
         pose = self._observation_pose(raw_observation)
         current_xyz = pose[:3] if pose is not None else None
         target_xyz = None if final_action is None else list(final_action[:3])
         if target_xyz is not None:
             self._target_history.append(target_xyz)
-        (step_dir / "recording").mkdir()
-        if self._camera_rig is not None:
-            recording_rgb = self._camera_rig.views_from_observation(raw_observation)
-            view = self._render(
-                recording_rgb, "BEFORE EXECUTION", step, current_xyz,
-                target_xyz, panel=self._panel(
-                    step, current_xyz, target_xyz,
-                    policy_metadata=policy_metadata,
-                    execution={
-                        "gripper_before": getattr(raw_observation, "gripper_open", None),
-                        "gripper_command": None if action is None else action.gripper,
-                    },
-                ),
-            )
-            Image.fromarray(self._render(
-                recording_rgb, "BEFORE EXECUTION", step, current_xyz, target_xyz
-            ), mode="RGB").save(
-                step_dir / "recording" / "before.png"
-            )
-            before_video_path = self._save_video_frame(view)
-            self._video_frame_paths.extend([before_video_path] * self.fps)
-            self._video_duration += 1.0
         self._last_step = {
             "step": int(step),
             "dir": step_dir,
@@ -452,13 +485,42 @@ class EpisodeRecorder:
             "policy_metadata": policy_metadata or {},
             "gripper_before": getattr(raw_observation, "gripper_open", None),
         }
+        try:
+            step_dir.mkdir(parents=True, exist_ok=False)
+            self._save_policy_images(raw_observation, step_dir / "observation_before")
+            self._save_policy_artifacts(step_dir, policy_metadata)
+            (step_dir / "recording").mkdir()
+            if self._camera_rig is not None:
+                recording_rgb = self._camera_rig.views_from_observation(raw_observation)
+                view = self._render(
+                    recording_rgb, "BEFORE EXECUTION", step, current_xyz,
+                    target_xyz, panel=self._panel(
+                        step, current_xyz, target_xyz,
+                        policy_metadata=policy_metadata,
+                        execution={
+                            "gripper_before": getattr(raw_observation, "gripper_open", None),
+                            "gripper_command": None if action is None else action.gripper,
+                        },
+                    ),
+                )
+                before_only = self._render(
+                    recording_rgb, "BEFORE EXECUTION", step, current_xyz, target_xyz
+                )
+                Image.fromarray(before_only, mode="RGB").save(
+                    step_dir / "recording" / "before.png"
+                )
+                before_video_path = self._save_video_frame(view)
+                self._video_frame_paths.extend([before_video_path] * self.fps)
+                self._video_duration += 1.0
+        except Exception as exc:
+            self._set_recording_error(exc)
         return self._last_step
 
     @contextmanager
     def capture_during_execution(self, scene):
         """Wrap scene.step with a passive RGB capture after each real sim step."""
         step = self._last_step
-        if self._camera_rig is None or step is None:
+        if step is None:
             yield
             return
         original_step = scene.step
@@ -467,34 +529,39 @@ class EpisodeRecorder:
         except Exception:
             sim_dt = 1.0 / self.fps
         sim_time = 0.0
+        self._next_video_time = 1.0 / self.fps
 
         def observed_step():
             nonlocal sim_time
             result = original_step()
             sim_time += sim_dt
-            try:
-                rgb = self._camera_rig.capture_views()
-                actual_xyz = scene.robot.arm.get_tip().get_position()
-                panel = self._panel(
-                    step["step"], step["current_xyz"], step["target_xyz"],
-                    actual_xyz=actual_xyz,
-                    policy_metadata=step["policy_metadata"],
-                    execution={
-                        "gripper_before": step["gripper_before"],
-                        "gripper_command": (
-                            None if step["action"] is None else step["action"].gripper
-                        ),
-                    },
-                )
-                composed = self._render(
-                    rgb, "EXECUTION", step["step"], step["current_xyz"],
-                    step["target_xyz"], actual_xyz=actual_xyz, panel=panel,
-                )
-                self._add_video_frame(composed, sim_time=sim_time)
-            except Exception as exc:
-                # Never let a rendering failure abort or alter the robot action.
-                if step.get("recording_error") is None:
-                    step["recording_error"] = f"{type(exc).__name__}: {exc}"
+            self.simulation_step_count += 1
+            self.simulation_time_seconds += sim_dt
+            if self._camera_rig is not None:
+                try:
+                    rgb = self._camera_rig.capture_views()
+                    actual_xyz = scene.robot.arm.get_tip().get_position()
+                    panel = self._panel(
+                        step["step"], step["current_xyz"], step["target_xyz"],
+                        actual_xyz=actual_xyz,
+                        policy_metadata=step["policy_metadata"],
+                        execution={
+                            "gripper_before": step["gripper_before"],
+                            "gripper_command": (
+                                None if step["action"] is None else step["action"].gripper
+                            ),
+                        },
+                    )
+                    composed = self._render(
+                        rgb, "EXECUTION", step["step"], step["current_xyz"],
+                        step["target_xyz"], actual_xyz=actual_xyz, panel=panel,
+                    )
+                    self._add_video_frame(composed, sim_time=sim_time)
+                except Exception as exc:
+                    # Never let a rendering failure abort or alter the robot action.
+                    if step.get("recording_error") is None:
+                        step["recording_error"] = f"{type(exc).__name__}: {exc}"
+                    self._set_recording_error(exc)
             return result
 
         scene.step = observed_step
@@ -511,8 +578,11 @@ class EpisodeRecorder:
         actual_pose = self._observation_pose(raw_observation_after)
         actual_xyz = actual_pose[:3] if actual_pose is not None else None
         if raw_observation_after is not None:
-            self._save_policy_images(raw_observation_after,
-                                     step_dir / "observation_after")
+            try:
+                self._save_policy_images(raw_observation_after,
+                                         step_dir / "observation_after")
+            except Exception as exc:
+                self._set_recording_error(exc)
         elif scene is not None:
             try:
                 actual_xyz = scene.robot.arm.get_tip().get_position()
@@ -521,32 +591,34 @@ class EpisodeRecorder:
 
         failure = execution.get("error")
         if self._camera_rig is not None:
-            recording_rgb = (
-                self._camera_rig.views_from_observation(raw_observation_after)
-                if raw_observation_after is not None
-                else self._camera_rig.capture_views()
-            )
-            after_only = self._render(
-                recording_rgb, "AFTER EXECUTION", step["step"], step["current_xyz"],
-                step["target_xyz"], actual_xyz=actual_xyz,
-                failure=failure,
-            )
-            Image.fromarray(after_only, mode="RGB").save(
-                step_dir / "recording" / "after.png"
-            )
-            panel = self._panel(
-                step["step"], step["current_xyz"], step["target_xyz"],
-                actual_xyz=actual_xyz, execution=execution,
-                policy_metadata=step["policy_metadata"],
-            )
-            after_video = self._render(
-                recording_rgb, "AFTER EXECUTION", step["step"], step["current_xyz"],
-                step["target_xyz"], actual_xyz=actual_xyz,
-                panel=panel, failure=failure,
-            )
-            after_path = self._save_video_frame(after_video)
-            self._video_frame_paths.extend([after_path] * self.fps)
-            self._video_duration += 1.0
+            try:
+                recording_rgb = (
+                    self._camera_rig.views_from_observation(raw_observation_after)
+                    if raw_observation_after is not None
+                    else self._camera_rig.capture_views()
+                )
+                after_only = self._render(
+                    recording_rgb, "AFTER EXECUTION", step["step"], step["current_xyz"],
+                    step["target_xyz"], actual_xyz=actual_xyz, failure=failure,
+                )
+                Image.fromarray(after_only, mode="RGB").save(
+                    step_dir / "recording" / "after.png"
+                )
+                panel = self._panel(
+                    step["step"], step["current_xyz"], step["target_xyz"],
+                    actual_xyz=actual_xyz, execution=execution,
+                    policy_metadata=step["policy_metadata"],
+                )
+                after_video = self._render(
+                    recording_rgb, "AFTER EXECUTION", step["step"], step["current_xyz"],
+                    step["target_xyz"], actual_xyz=actual_xyz,
+                    panel=panel, failure=failure,
+                )
+                after_path = self._save_video_frame(after_video)
+                self._video_frame_paths.extend([after_path] * self.fps)
+                self._video_duration += 1.0
+            except Exception as exc:
+                self._set_recording_error(exc)
 
         execution = dict(execution)
         execution.setdefault("task", self.task)
@@ -565,6 +637,10 @@ class EpisodeRecorder:
         execution.setdefault("gripper_after", getattr(raw_observation_after,
                                                         "gripper_open", None))
         policy_metadata = step["policy_metadata"]
+        if isinstance(policy_metadata, dict):
+            for field in ("requested_model", "resolved_model", "codex_cli_version"):
+                if field in policy_metadata:
+                    self._run_meta[field] = policy_metadata[field]
         execution.setdefault("policy_latency_seconds",
                              policy_metadata.get("latency_seconds"))
         execution.setdefault("token_usage", policy_metadata.get("token_usage"))
@@ -572,10 +648,17 @@ class EpisodeRecorder:
                              policy_metadata.get("tool_call_detected"))
         if step.get("recording_error"):
             execution["recording_error"] = step["recording_error"]
-        _write_json(step_dir / "execution.json", execution)
-        line = json.dumps(_jsonable(execution), ensure_ascii=False, allow_nan=False)
-        self._log_file.write(line + "\n")
-        self._log_file.flush()
+        execution["simulation_step_count"] = self.simulation_step_count
+        execution["simulation_time_seconds"] = self.simulation_time_seconds
+        if self.recording_error:
+            execution["recording_error"] = self.recording_error
+        try:
+            _write_json(step_dir / "execution.json", execution)
+            line = json.dumps(_jsonable(execution), ensure_ascii=False, allow_nan=False)
+            self._log_file.write(line + "\n")
+            self._log_file.flush()
+        except Exception as exc:
+            self._set_recording_error(exc)
         self._last_step = None
         return execution
 
@@ -597,43 +680,96 @@ class EpisodeRecorder:
         record.setdefault("kind", "episode_summary")
         record.setdefault("task", self.task)
         record.setdefault("episode", self.episode)
-        line = json.dumps(_jsonable(record), ensure_ascii=False, allow_nan=False)
-        self._log_file.write(line + "\n")
-        self._log_file.flush()
-        self._run_meta.update(_jsonable(record))
+        record.setdefault("simulation_step_count", self.simulation_step_count)
+        record.setdefault("simulation_time_seconds", self.simulation_time_seconds)
+        record["recording_status"] = self.recording_status
+        record["recording_error"] = self.recording_error
+        self._episode_summary = _jsonable(record)
+        self._write_summary_files(append_log=True)
+
+    def _write_summary_files(self, append_log=False):
+        if self._episode_summary is None:
+            return
+        record = self._episode_summary
+        line = json.dumps(record, ensure_ascii=False, allow_nan=False)
+        temp_path = self.summary_path.with_suffix(".json.tmp")
+        with temp_path.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, indent=2,
+                                    allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, self.summary_path)
+        if append_log:
+            self._log_file.write(line + "\n")
+            self._log_file.flush()
+        self._run_meta.update(record)
         self._run_meta["finished_at"] = datetime.now(timezone.utc).isoformat()
-        self._run_meta["video_duration_seconds"] = self._video_duration
+        self._run_meta.setdefault("video_duration_seconds", None)
+        self._run_meta["video_duration_planned_seconds"] = self._video_duration
+        self._run_meta["simulation_step_count"] = self.simulation_step_count
+        self._run_meta["simulation_time_seconds"] = self.simulation_time_seconds
+        self._run_meta["recording_status"] = self.recording_status
+        self._run_meta["recording_error"] = self.recording_error
         _write_json(self.run_dir / "run_meta.json", self._run_meta)
+
+    def update_summary(self, summary):
+        """Update the saved summary without appending a duplicate episode row."""
+        if self._episode_summary is None:
+            raise RuntimeError("write_summary() must be called before update_summary()")
+        self._episode_summary.update(_jsonable(summary))
+        self._episode_summary["recording_status"] = self.recording_status
+        self._episode_summary["recording_error"] = self.recording_error
+        self._write_summary_files(append_log=False)
 
     def finalize_video(self, summary):
-        if self._camera_rig is None:
+        if not self.record_video:
+            self.recording_status = "disabled"
+            if self._episode_summary is not None:
+                self.update_summary(summary)
             return None
-        import cv2
-
-        video_path = self.video_dir / "episode_summary.mp4"
-        writer = cv2.VideoWriter(
-            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
-            (self.video_width, self.video_height),
-        )
-        if not writer.isOpened():
-            writer.release()
-            raise RuntimeError("OpenCV could not open MP4 video writer")
+        if self._camera_rig is None:
+            if self.recording_error is None:
+                self.recording_status = "failed"
+                self.recording_error = "camera_not_initialized"
+            if self._episode_summary is not None:
+                self.update_summary(summary)
+            return None
         try:
-            for frame_path in self._video_frame_paths:
-                bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-                if bgr is None or bgr.shape[:2] != (
-                        self.video_height, self.video_width):
-                    raise RuntimeError(f"invalid composed video frame: {frame_path}")
-                writer.write(bgr)
-        finally:
-            writer.release()
-        self._run_meta["video_path"] = str(video_path)
-        self._run_meta["video_resolution"] = [self.video_width, self.video_height]
-        self._run_meta["video_fps"] = self.fps
-        self._run_meta["video_frame_count"] = len(self._video_frame_paths)
-        self._run_meta["video_duration_seconds"] = len(self._video_frame_paths) / self.fps
-        _write_json(self.run_dir / "run_meta.json", self._run_meta)
-        return video_path
+            import cv2
+
+            video_path = self.video_dir / "episode_summary.mp4"
+            writer = cv2.VideoWriter(
+                str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
+                (self.video_width, self.video_height),
+            )
+            if not writer.isOpened():
+                writer.release()
+                raise RuntimeError("OpenCV could not open MP4 video writer")
+            try:
+                for frame_path in self._video_frame_paths:
+                    bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+                    if bgr is None or bgr.shape[:2] != (
+                            self.video_height, self.video_width):
+                        raise RuntimeError(f"invalid composed video frame: {frame_path}")
+                    writer.write(bgr)
+            finally:
+                writer.release()
+            self._run_meta["video_path"] = str(video_path)
+            self._run_meta["video_resolution"] = [self.video_width, self.video_height]
+            self._run_meta["video_fps"] = self.fps
+            self._run_meta["video_frame_count"] = len(self._video_frame_paths)
+            self._run_meta["video_duration_seconds"] = len(self._video_frame_paths) / self.fps
+            self.recording_status = (
+                "partial" if self.recording_error is not None else "complete"
+            )
+            if self._episode_summary is not None:
+                self.update_summary(summary)
+            return video_path
+        except Exception as exc:
+            self._set_recording_error(exc)
+            if self._episode_summary is not None:
+                self.update_summary(summary)
+            return None
 
     def close(self):
         if not self._log_file.closed:

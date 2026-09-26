@@ -1,10 +1,7 @@
 """Small, API-neutral schemas passed between the evaluator and a policy."""
 
 from dataclasses import dataclass
-from typing import Dict, Sequence
-
-import numpy as np
-
+from typing import Any, Dict, Optional, Sequence
 
 @dataclass(frozen=True)
 class AstraObservation:
@@ -16,15 +13,16 @@ class AstraObservation:
     """
 
     instruction: str
-    images: Dict[str, np.ndarray]
+    images: Dict[str, Any]
     eef_pose: Sequence[float]
     gripper_open: bool
 
 
 @dataclass(frozen=True)
 class AstraAction:
-    """Absolute world-frame end-effector target and discrete gripper command."""
+    """Absolute world-frame target; ``ignore_collisions`` is mode-dependent."""
 
     position: Sequence[float]
     quaternion: Sequence[float]
     gripper: int
+    ignore_collisions: Optional[int] = None
