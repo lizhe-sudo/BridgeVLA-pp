@@ -84,13 +84,14 @@ def _build_parser():
                         help="Codex CLI timeout in seconds (default: 180)")
     parser.add_argument(
         "--codex-work-root",
-        default=os.path.join(REPO_ROOT, "tmp", "rlbench_codex_policy"),
-        help="directory for per-episode Codex inference artifacts",
+        default=None,
+        help=("explicit directory for persistent Codex policy artifacts; defaults "
+              "to <run-directory>/policy_work"),
     )
     parser.add_argument(
         "--output-root",
-        default=os.path.join(REPO_ROOT, "outputs", "astra_rlbench_runs"),
-        help="formal output directory for per-episode artifacts and videos",
+        default=None,
+        help="output root (default: <repository-root>/outputs, independent of cwd)",
     )
     parser.add_argument(
         "--record-video", action=argparse.BooleanOptionalAction, default=True,
@@ -146,10 +147,7 @@ def _jsonable(value):
 
 
 def _exception_category(exc):
-    name = type(exc).__name__
-    if name in ("IKError", "ConfigurationPathError", "InvalidActionError"):
-        return name
-    return name or "Error"
+    return type(exc).__name__ or "Error"
 
 
 def _token_counts(policy_metadata):
@@ -170,33 +168,47 @@ def _token_counts(policy_metadata):
 
 
 def _classify_error(exc, phase, metadata=None):
-    """Keep simulator/service failures separate from controller failures."""
+    """Classify from typed errors and exception classes, never message text."""
+    from astra.errors import (
+        CoreArtifactWriteError,
+        InferenceDeadlineExceeded,
+        InvalidPolicyOutput,
+        ModelServiceError,
+        PolicyToolViolation,
+        SimulatorInfrastructureError,
+    )
+
     name = _exception_category(exc)
-    message = str(exc).lower()
     metadata = metadata or {}
-    if name in ("IKError", "ConfigurationPathError", "InvalidActionError"):
-        return "policy_failure", name
-    if phase in ("reset", "observation"):
-        return "infrastructure_error", name
-    if phase == "policy":
-        if metadata.get("tool_call_detected"):
-            return "policy_failure", "tool_use_violation"
-        if "timed out after" in message:
-            return "policy_failure", "inference_budget_exhausted"
-        if any(part in message for part in (
-                "codex action json is invalid", "action must contain",
-                "codex action must", "codex did not create action.json",
-                "position must", "quaternion", "gripper must",
-                "ignore_collisions must", "tool; refusing to return its action")):
-            return "policy_failure", name
-        return "infrastructure_error", name
+    if isinstance(exc, PolicyToolViolation) or metadata.get("tool_call_detected") is True:
+        return "policy_failure", "tool_use_violation"
+    if isinstance(exc, InvalidPolicyOutput):
+        return "policy_failure", exc.error_code
+    if isinstance(exc, InferenceDeadlineExceeded):
+        return "policy_failure", exc.error_code
+    if isinstance(exc, (ModelServiceError, SimulatorInfrastructureError,
+                        CoreArtifactWriteError)):
+        return "infrastructure_error", exc.error_code
     if phase == "action_validation":
-        return "policy_failure", "InvalidActionError"
+        return "policy_failure", "invalid_policy_action"
     if phase == "environment_step":
-        if name in ("ConfigurationPathError", "IKError", "InvalidActionError"):
+        known_policy_errors = {"ConfigurationPathError", "IKError", "InvalidActionError"}
+        if any(base.__name__ in known_policy_errors for base in type(exc).__mro__):
             return "policy_failure", name
+        if isinstance(exc, (OSError, EOFError, ChildProcessError)):
+            return "infrastructure_error", name
+        return "unknown", "unclassified_environment_error"
+    if phase in ("reset", "observation") and isinstance(
+            exc, (OSError, EOFError, ImportError, ModuleNotFoundError)):
         return "infrastructure_error", name
-    return "unknown", name
+    return "unknown", "unclassified_error"
+
+
+def _safe_error_message(exc):
+    from astra.errors import safe_exception_record
+
+    detail = safe_exception_record(exc)
+    return f"{detail['error_type']} [{detail['error_code']}]: {detail['error_summary']}"
 
 
 def _git_value(*args):
@@ -210,15 +222,26 @@ def _git_value(*args):
 
 
 def _write_json_atomic(path, value):
+    from astra.errors import CoreArtifactWriteError
+
     path = os.path.abspath(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     temp_path = path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as stream:
-        json.dump(_jsonable(value), stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temp_path, path)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as stream:
+            json.dump(_jsonable(value), stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except Exception as exc:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise CoreArtifactWriteError(
+            f"failed to persist core run artifact {os.path.basename(path)}"
+        ) from exc
 
 
 def _metadata_for_step(policy, expected):
@@ -239,6 +262,7 @@ def _emit(record, log_file=None):
 
 
 def run_eval(args):
+    from astra.errors import CoreArtifactWriteError
     from astra.experiment import (
         EVAL_TASKS, SANITY_CHECK_TASKS, aggregate_results,
         load_episode_ids, read_step_limits, resolve_budgets,
@@ -296,20 +320,42 @@ def run_eval(args):
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         + "_" + uuid.uuid4().hex[:8]
     )
-    output_root = os.path.abspath(os.path.expanduser(args.output_root))
-    run_dir = os.path.join(output_root, evaluation_id)
-    os.makedirs(run_dir, exist_ok=False)
+    from astra.output_paths import resolve_output_layout
+
+    layout = resolve_output_layout(
+        REPO_ROOT,
+        evaluation_id,
+        output_root=args.output_root,
+        codex_work_root=args.codex_work_root,
+        log_file=args.log_file,
+    )
+    run_dir = str(layout.run_dir)
+    policy_work_dir = str(layout.policy_work_dir)
     output_dir = os.path.join(run_dir, "episodes")
-    os.makedirs(output_dir)
-    run_log_path = os.path.abspath(args.log_file) if args.log_file else os.path.join(run_dir, "run.jsonl")
-    os.makedirs(os.path.dirname(run_log_path), exist_ok=True)
-    log_file = open(run_log_path, "a", encoding="utf-8")
+    run_log_path = str(layout.run_log_path)
+    try:
+        os.makedirs(run_dir, exist_ok=False)
+        os.makedirs(policy_work_dir, exist_ok=True)
+        os.makedirs(output_dir)
+        os.makedirs(os.path.dirname(run_log_path), exist_ok=True)
+        log_file = open(run_log_path, "a", encoding="utf-8")
+    except OSError as exc:
+        raise CoreArtifactWriteError(
+            "failed to prepare persistent run artifact directories"
+        ) from exc
+    if layout.external_overrides:
+        print(
+            "[eval_astra] non-unified artifact paths explicitly selected: "
+            + ", ".join(layout.external_overrides),
+            file=sys.stderr,
+            flush=True,
+        )
 
     planned_total = len(tasks) * args.eval_episodes * args.repeats
     planned_manifest = [
         {"repeat_id": repeat_id, "task": task, "episode_id": episode_id}
-        for repeat_id in range(1, args.repeats + 1)
         for task in tasks
+        for repeat_id in range(1, args.repeats + 1)
         for episode_id in episode_ids
     ]
     start_status = _git_value("status", "--porcelain=v1")
@@ -403,19 +449,36 @@ def run_eval(args):
         },
         "output": {
             "run_directory": run_dir,
+            "artifact_layout": layout.as_dict(),
             "manifest": manifest_path,
             "run_log": run_log_path,
+            "policy_work_directory": policy_work_dir,
             "episode_artifacts_directory": output_dir,
             "recording_enabled": args.record_video,
         },
         "arguments": vars(args),
         "episode_results": [],
     }
-    _write_json_atomic(manifest_path, manifest)
+    try:
+        _write_json_atomic(manifest_path, manifest)
+    except Exception:
+        log_file.close()
+        raise
+
+    run_log_errors = []
 
     def emit(record):
         record = {"evaluation_id": evaluation_id, **record}
-        _emit(record, log_file)
+        line = json.dumps(_jsonable(record), ensure_ascii=False, allow_nan=False)
+        print(line, flush=True)
+        try:
+            log_file.write(line + "\n")
+            log_file.flush()
+        except Exception as exc:
+            from astra.errors import sanitize_diagnostic
+            run_log_errors.append(sanitize_diagnostic(
+                f"{type(exc).__name__}: {exc}"
+            )["text"])
 
     def save_manifest():
         _write_json_atomic(manifest_path, manifest)
@@ -429,6 +492,7 @@ def run_eval(args):
         }
 
     results = []
+    active_recorder = None
     try:
         try:
             sim_paths = _add_project_paths(args.allow_shared_sim_stack)
@@ -437,7 +501,7 @@ def run_eval(args):
             manifest["initialization_error"] = {
                 "error_class": "infrastructure_error",
                 "type": type(exc).__name__,
-                "message": str(exc),
+                "message": _safe_error_message(exc),
             }
             manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
             save_manifest()
@@ -533,7 +597,7 @@ def run_eval(args):
                 model=args.codex_model,
                 reasoning_effort=args.codex_reasoning,
                 timeout=args.codex_timeout,
-                work_root=args.codex_work_root,
+                work_root=policy_work_dir,
                 collision_mode=args.collision_mode,
             )
             manifest["codex_cli_version"] = policy.codex_cli_version
@@ -630,6 +694,7 @@ def run_eval(args):
                                 ),
                             },
                         )
+                        active_recorder = recorder
                         actual_input_shapes = None
                         eval_env._last_exception = None
                         try:
@@ -672,7 +737,7 @@ def run_eval(args):
                             recorder.initialize_camera(eval_env._task._scene, raw_obs)
                         except Exception as exc:
                             error_class, error_reason = _classify_error(exc, "reset")
-                            error_message = f"{type(exc).__name__}: {exc}"
+                            error_message = _safe_error_message(exc)
                             termination = "infrastructure_error_during_reset"
 
                         if raw_obs is not None and error_class is None:
@@ -745,7 +810,7 @@ def run_eval(args):
                                     error_class, error_reason = _classify_error(
                                         exc, phase, policy_metadata
                                     )
-                                    error_message = f"{type(exc).__name__}: {exc}"
+                                    error_message = _safe_error_message(exc)
                                     recorder.record_step_failure(
                                         step_id, raw_obs, error_message, policy_metadata
                                     )
@@ -781,7 +846,7 @@ def run_eval(args):
                                     error_class, error_reason = _classify_error(
                                         planner_error, "environment_step", policy_metadata
                                     )
-                                    error_message = f"{type(planner_error).__name__}: {planner_error}"
+                                    error_message = _safe_error_message(planner_error)
                                     raw_after = None
                                 else:
                                     raw_after = eval_env.last_raw_observation
@@ -920,7 +985,7 @@ def run_eval(args):
                                 error_reason = "action_budget_exhausted"
                                 termination = "waypoint_budget_exhausted"
 
-                        if error_class == "infrastructure_error":
+                        if error_class in ("infrastructure_error", "unknown"):
                             manifest["status"] = "incomplete"
                         if args.policy == "codex":
                             manifest["resolved_model"] = latest_resolved_model
@@ -938,7 +1003,7 @@ def run_eval(args):
                             ) for key in token_fields
                         }
                         attempted = True
-                        evaluable = error_class != "infrastructure_error"
+                        evaluable = error_class not in ("infrastructure_error", "unknown")
                         episode_result = {
                             "task": task_name,
                             "task_group": task_groups[task_name],
@@ -948,7 +1013,8 @@ def run_eval(args):
                             "planned": True,
                             "attempted": attempted,
                             "evaluable": evaluable,
-                            "success": bool(episode_success),
+                            "success": bool(episode_success) if evaluable else None,
+                            "observed_task_success": bool(episode_success),
                             "reward": episode_reward,
                             "steps": policy_decisions,
                             "waypoint_budget": budgets[task_name],
@@ -974,6 +1040,8 @@ def run_eval(args):
                             "error_reason": error_reason,
                             "error": error_message,
                             "recording_error": recorder.recording_error,
+                            "redundant_record_errors": list(recorder.redundant_record_errors),
+                            "core_records_complete": True,
                             "output_directory": str(recorder.run_dir),
                         }
                         summary = {
@@ -990,21 +1058,29 @@ def run_eval(args):
                             "history_enabled": False,
                             "image_shapes_hw": actual_input_shapes,
                         }
-                        # Commit the result to disk before any lossy video encoding.
+                        # The episode summary is authoritative; save the result and
+                        # manifest before attempting optional video encoding.
                         recorder.write_summary(summary)
-                        recorder.finalize_video(summary)
-                        summary["recording_error"] = recorder.recording_error
-                        summary["recording_status"] = recorder.recording_status
-                        recorder.update_summary(summary)
                         episode_result["recording_error"] = recorder.recording_error
                         episode_result["output_directory"] = str(recorder.run_dir)
                         results.append(episode_result)
                         manifest["episode_results"] = results
                         manifest["last_updated_at"] = datetime.now(timezone.utc).isoformat()
                         save_manifest()
+                        recorder.finalize_video(summary)
+                        summary["recording_error"] = recorder.recording_error
+                        summary["recording_status"] = recorder.recording_status
+                        recorder.update_summary(summary)
+                        episode_result["recording_error"] = recorder.recording_error
+                        episode_result["redundant_record_errors"] = list(
+                            recorder.redundant_record_errors
+                        )
+                        manifest["episode_results"] = results
+                        save_manifest()
                         emit(summary)
                         recorder.close()
-                        if error_class == "infrastructure_error":
+                        active_recorder = None
+                        if error_class in ("infrastructure_error", "unknown"):
                             break
                     if manifest["status"] == "incomplete":
                         break
@@ -1019,13 +1095,25 @@ def run_eval(args):
             planned_by_task={task: args.eval_episodes for task in tasks},
             repeat_ids=list(range(1, args.repeats + 1)),
             selected_tasks=tasks,
+            expected_episode_ids={task: episode_ids for task in tasks},
         )
         planned = planned_total
         attempted = len(results)
         infrastructure_count = sum(
             result.get("error_class") == "infrastructure_error" for result in results
         )
-        status = "complete" if attempted == planned and infrastructure_count == 0 else "incomplete"
+        unknown_count = sum(result.get("error_class") == "unknown" for result in results)
+        status = (
+            "complete" if attempted == planned and infrastructure_count == 0
+            and unknown_count == 0 and aggregates["invalid_identity_rows"] == 0
+            and not aggregates["unexpected_experiment_units"]
+            and not aggregates["duplicate_experiment_units"]
+            and all(
+                row["completion_status"] == "complete"
+                for row in aggregates["task_results"]
+            )
+            else "incomplete"
+        )
         summary = {
             "evaluation_id": evaluation_id,
             "experiment_name": "Astra-Direct-RGB",
@@ -1042,7 +1130,9 @@ def run_eval(args):
             "successes": sum(result.get("success") is True for result in results),
             "policy_failures": sum(result.get("error_class") == "policy_failure" for result in results),
             "infrastructure_errors": infrastructure_count,
+            "unknown_errors": unknown_count,
             "recording_errors": sum(bool(result.get("recording_error")) for result in results),
+            "run_log_errors": list(run_log_errors),
             "success_rate_units": "fraction in [0, 1]",
             "episode_results": results,
             **aggregates,
@@ -1059,30 +1149,57 @@ def run_eval(args):
               "kind": "run_summary", **summary})
         return results
     except Exception as exc:
-        if manifest.get("status") not in ("incomplete", "complete"):
-            manifest["status"] = "incomplete"
+        from astra.errors import safe_exception_record
+
+        manifest["status"] = "incomplete"
+        error_class, error_reason = _classify_error(exc, "run")
         manifest["runtime_error"] = {
-            "type": type(exc).__name__, "message": str(exc),
-            "error_class": "infrastructure_error",
+            **safe_exception_record(exc),
+            "error_class": error_class,
+            "error_reason": error_reason,
         }
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-        save_manifest()
         try:
+            save_manifest()
+        except Exception:
+            manifest["runtime_manifest_write_failed"] = True
+        try:
+            exception_aggregates = aggregate_results(
+                results,
+                planned_by_task={task: args.eval_episodes for task in tasks},
+                repeat_ids=list(range(1, args.repeats + 1)),
+                selected_tasks=tasks,
+                expected_episode_ids={task: episode_ids for task in tasks},
+            )
             _write_json_atomic(os.path.join(run_dir, "run_summary.json"), {
                 "evaluation_id": evaluation_id,
                 "completion_status": "incomplete",
                 "planned_episodes": planned_total,
                 "attempted_episodes": len(results),
-                "infrastructure_errors": 1,
+                "infrastructure_errors": sum(
+                    result.get("error_class") == "infrastructure_error"
+                    for result in results
+                ),
+                "unknown_errors": sum(
+                    result.get("error_class") == "unknown" for result in results
+                ),
                 "episode_results": results,
+                "run_log_errors": list(run_log_errors),
                 "error": manifest["runtime_error"],
+                **exception_aggregates,
             })
-        except Exception:
+        except Exception as summary_error:
             raise RuntimeError(
-                f"evaluation failed ({type(exc).__name__}: {exc}) and result files could not be saved"
-            ) from exc
+                "evaluation failed and run_summary.json could not be persisted; "
+                "the run cannot be claimed complete"
+            ) from summary_error
         raise
     finally:
+        if active_recorder is not None:
+            try:
+                active_recorder.close()
+            except Exception:
+                pass
         if not log_file.closed:
             log_file.close()
 
@@ -1093,7 +1210,7 @@ def main(argv=None):
     try:
         run_eval(args)
     except (ValueError, RuntimeError) as exc:
-        parser.error(str(exc))
+        parser.error(_safe_error_message(exc))
 
 
 if __name__ == "__main__":

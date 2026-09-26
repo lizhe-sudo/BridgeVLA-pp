@@ -14,6 +14,7 @@ from PIL import Image
 from .visualization import (
     render_policy_grid,
 )
+from .errors import CoreArtifactWriteError, sanitize_diagnostic
 
 
 POLICY_CAMERAS = ("front", "left_shoulder", "right_shoulder", "wrist")
@@ -44,11 +45,23 @@ def _jsonable(value):
 
 
 def _write_json(path, value):
-    path.write_text(
-        json.dumps(_jsonable(value), ensure_ascii=False, indent=2,
-                   allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    temp_path = path.with_name(path.name + ".tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as stream:
+            json.dump(_jsonable(value), stream, ensure_ascii=False,
+                      indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except Exception as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise CoreArtifactWriteError(
+            f"failed to persist JSON artifact {Path(path).name}"
+        ) from exc
 
 
 class PolicyCameraView:
@@ -204,15 +217,20 @@ class EpisodeRecorder:
         self.video_width = self.video_height = self.view_size * 2
         self.run_id = self._new_run_id()
         self.run_dir = self.output_root / self.run_id
-        self.run_dir.mkdir(parents=True, exist_ok=False)
         self.steps_dir = self.run_dir / "steps"
-        self.steps_dir.mkdir()
         self.video_dir = self.run_dir / "video"
         self.video_frames_dir = self.video_dir / "frames"
-        if self.record_video:
-            self.video_frames_dir.mkdir(parents=True)
         self.log_path = self.run_dir / "episode_log.jsonl"
-        self._log_file = self.log_path.open("a", encoding="utf-8")
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=False)
+            self.steps_dir.mkdir()
+            if self.record_video:
+                self.video_frames_dir.mkdir(parents=True)
+            self._log_file = self.log_path.open("a", encoding="utf-8")
+        except OSError as exc:
+            raise CoreArtifactWriteError(
+                "failed to prepare episode artifact directories"
+            ) from exc
         self._camera_rig = None
         self._video_frame_paths = []
         self._frame_index = 0
@@ -221,6 +239,7 @@ class EpisodeRecorder:
         self.simulation_step_count = 0
         self.simulation_time_seconds = 0.0
         self.recording_error = None
+        self.redundant_record_errors = []
         self.recording_status = "pending" if self.record_video else "disabled"
         self.summary_path = self.run_dir / "episode_summary.json"
         self._episode_summary = None
@@ -262,7 +281,10 @@ class EpisodeRecorder:
             "recording_status": self.recording_status,
             "recording_error": None,
         }
-        _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        try:
+            _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        except Exception as exc:
+            self._add_redundant_record_error("run_meta.json", exc)
 
     def _new_run_id(self):
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -285,19 +307,21 @@ class EpisodeRecorder:
             self._camera_rig = None
 
     def _set_recording_error(self, exc):
-        if isinstance(exc, BaseException):
-            message = f"{type(exc).__name__}: {exc}"
-        else:
-            message = str(exc)
+        raw_message = f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc)
+        message = sanitize_diagnostic(raw_message)["text"]
         self.recording_error = self.recording_error or message
         self.recording_status = "failed"
         self._run_meta["recording_status"] = self.recording_status
         self._run_meta["recording_error"] = self.recording_error
+        return message
 
     def _initialize_camera(self, scene, raw_observation=None):
         self._camera_rig = PolicyCameraRig(scene, self.view_size)
         self._run_meta["recording_views"] = self._camera_rig.metadata()
-        _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        try:
+            _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        except Exception as exc:
+            self._add_redundant_record_error("run_meta.json", exc)
         views = (
             self._camera_rig.views_from_observation(raw_observation)
             if raw_observation is not None
@@ -323,7 +347,7 @@ class EpisodeRecorder:
         try:
             _write_json(self.run_dir / "run_meta.json", self._run_meta)
         except Exception as exc:
-            self._set_recording_error(exc)
+            self._add_redundant_record_error("run_meta.json", exc)
 
     @staticmethod
     def _observation_pose(observation):
@@ -349,10 +373,15 @@ class EpisodeRecorder:
 
     @staticmethod
     def _copy_or_write(src, target, fallback=""):
-        if src and Path(src).is_file():
-            shutil.copyfile(src, target)
-        else:
-            target.write_text(fallback, encoding="utf-8")
+        try:
+            if src and Path(src).is_file():
+                shutil.copyfile(src, target)
+            else:
+                target.write_text(fallback, encoding="utf-8")
+        except Exception as exc:
+            raise CoreArtifactWriteError(
+                f"failed to copy core policy artifact {Path(target).name}"
+            ) from exc
 
     def _save_policy_artifacts(self, step_dir, policy_metadata):
         codex_dir = step_dir
@@ -369,8 +398,8 @@ class EpisodeRecorder:
             return
         self._copy_or_write(metadata.get("prompt_path"), codex_dir / "prompt.txt",
                             metadata.get("prompt", ""))
-        schema_source = None
-        if metadata.get("action_json_path"):
+        schema_source = metadata.get("action_schema_path")
+        if not schema_source and metadata.get("action_json_path"):
             candidate = Path(metadata["action_json_path"]).with_name("action_schema.json")
             if candidate.exists():
                 schema_source = str(candidate)
@@ -382,8 +411,12 @@ class EpisodeRecorder:
             )
         else:
             self._copy_or_write(schema_source, codex_dir / "action_schema.json")
-        self._copy_or_write(metadata.get("action_json_path"),
-                            codex_dir / "codex_action.json")
+        accepted_action = metadata.get("accepted_action_path") or metadata.get("action_json_path")
+        if accepted_action and Path(accepted_action).is_file():
+            self._copy_or_write(accepted_action, codex_dir / "accepted_action.json")
+        rejected = metadata.get("rejected_output_path")
+        if rejected and Path(rejected).is_file():
+            self._copy_or_write(rejected, codex_dir / "rejected_output.json")
         self._copy_or_write(metadata.get("event_jsonl_path"),
                             codex_dir / "codex_events.jsonl")
         if metadata.get("event_jsonl_path"):
@@ -489,8 +522,16 @@ class EpisodeRecorder:
             step_dir.mkdir(parents=True, exist_ok=False)
             self._save_policy_images(raw_observation, step_dir / "observation_before")
             self._save_policy_artifacts(step_dir, policy_metadata)
-            (step_dir / "recording").mkdir()
-            if self._camera_rig is not None:
+        except CoreArtifactWriteError:
+            raise
+        except Exception as exc:
+            raise CoreArtifactWriteError(
+                f"failed to persist core inputs for step {step}"
+            ) from exc
+
+        if self._camera_rig is not None:
+            try:
+                (step_dir / "recording").mkdir()
                 recording_rgb = self._camera_rig.views_from_observation(raw_observation)
                 view = self._render(
                     recording_rgb, "BEFORE EXECUTION", step, current_xyz,
@@ -512,8 +553,8 @@ class EpisodeRecorder:
                 before_video_path = self._save_video_frame(view)
                 self._video_frame_paths.extend([before_video_path] * self.fps)
                 self._video_duration += 1.0
-        except Exception as exc:
-            self._set_recording_error(exc)
+            except Exception as exc:
+                self._set_recording_error(exc)
         return self._last_step
 
     @contextmanager
@@ -560,8 +601,9 @@ class EpisodeRecorder:
                 except Exception as exc:
                     # Never let a rendering failure abort or alter the robot action.
                     if step.get("recording_error") is None:
-                        step["recording_error"] = f"{type(exc).__name__}: {exc}"
-                    self._set_recording_error(exc)
+                        step["recording_error"] = self._set_recording_error(exc)
+                    else:
+                        self._set_recording_error(exc)
             return result
 
         scene.step = observed_step
@@ -654,13 +696,22 @@ class EpisodeRecorder:
             execution["recording_error"] = self.recording_error
         try:
             _write_json(step_dir / "execution.json", execution)
+        except Exception as exc:
+            raise CoreArtifactWriteError(
+                f"failed to persist canonical execution record for step {step['step']}"
+            ) from exc
+        try:
             line = json.dumps(_jsonable(execution), ensure_ascii=False, allow_nan=False)
             self._log_file.write(line + "\n")
             self._log_file.flush()
         except Exception as exc:
-            self._set_recording_error(exc)
+            self._add_redundant_record_error("episode_log.jsonl", exc)
         self._last_step = None
         return execution
+
+    def _add_redundant_record_error(self, path_name, exc):
+        detail = sanitize_diagnostic(f"{type(exc).__name__}: {exc}")["text"]
+        self.redundant_record_errors.append({"path": path_name, "error": detail})
 
     def record_step_failure(self, step, raw_observation, error, policy_metadata=None):
         self.begin_step(step, raw_observation, policy_metadata=policy_metadata)
@@ -690,19 +741,22 @@ class EpisodeRecorder:
     def _write_summary_files(self, append_log=False):
         if self._episode_summary is None:
             return
-        record = self._episode_summary
-        line = json.dumps(record, ensure_ascii=False, allow_nan=False)
-        temp_path = self.summary_path.with_suffix(".json.tmp")
-        with temp_path.open("w", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, indent=2,
-                                    allow_nan=False) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp_path, self.summary_path)
+        def persist_authoritative_summary():
+            self._episode_summary["redundant_record_errors"] = list(
+                self.redundant_record_errors
+            )
+            _write_json(self.summary_path, self._episode_summary)
+
+        persist_authoritative_summary()
         if append_log:
-            self._log_file.write(line + "\n")
-            self._log_file.flush()
-        self._run_meta.update(record)
+            try:
+                line = json.dumps(self._episode_summary, ensure_ascii=False, allow_nan=False)
+                self._log_file.write(line + "\n")
+                self._log_file.flush()
+            except Exception as exc:
+                self._add_redundant_record_error("episode_log.jsonl", exc)
+                persist_authoritative_summary()
+        self._run_meta.update(self._episode_summary)
         self._run_meta["finished_at"] = datetime.now(timezone.utc).isoformat()
         self._run_meta.setdefault("video_duration_seconds", None)
         self._run_meta["video_duration_planned_seconds"] = self._video_duration
@@ -710,7 +764,11 @@ class EpisodeRecorder:
         self._run_meta["simulation_time_seconds"] = self.simulation_time_seconds
         self._run_meta["recording_status"] = self.recording_status
         self._run_meta["recording_error"] = self.recording_error
-        _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        try:
+            _write_json(self.run_dir / "run_meta.json", self._run_meta)
+        except Exception as exc:
+            self._add_redundant_record_error("run_meta.json", exc)
+            persist_authoritative_summary()
 
     def update_summary(self, summary):
         """Update the saved summary without appending a duplicate episode row."""
@@ -727,49 +785,48 @@ class EpisodeRecorder:
             if self._episode_summary is not None:
                 self.update_summary(summary)
             return None
+        video_path = None
         if self._camera_rig is None:
             if self.recording_error is None:
                 self.recording_status = "failed"
                 self.recording_error = "camera_not_initialized"
-            if self._episode_summary is not None:
-                self.update_summary(summary)
-            return None
-        try:
-            import cv2
-
-            video_path = self.video_dir / "episode_summary.mp4"
-            writer = cv2.VideoWriter(
-                str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
-                (self.video_width, self.video_height),
-            )
-            if not writer.isOpened():
-                writer.release()
-                raise RuntimeError("OpenCV could not open MP4 video writer")
+        else:
             try:
-                for frame_path in self._video_frame_paths:
-                    bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-                    if bgr is None or bgr.shape[:2] != (
-                            self.video_height, self.video_width):
-                        raise RuntimeError(f"invalid composed video frame: {frame_path}")
-                    writer.write(bgr)
-            finally:
-                writer.release()
-            self._run_meta["video_path"] = str(video_path)
-            self._run_meta["video_resolution"] = [self.video_width, self.video_height]
-            self._run_meta["video_fps"] = self.fps
-            self._run_meta["video_frame_count"] = len(self._video_frame_paths)
-            self._run_meta["video_duration_seconds"] = len(self._video_frame_paths) / self.fps
-            self.recording_status = (
-                "partial" if self.recording_error is not None else "complete"
-            )
-            if self._episode_summary is not None:
-                self.update_summary(summary)
-            return video_path
-        except Exception as exc:
-            self._set_recording_error(exc)
-            if self._episode_summary is not None:
-                self.update_summary(summary)
-            return None
+                import cv2
+
+                video_path = self.video_dir / "episode_summary.mp4"
+                writer = cv2.VideoWriter(
+                    str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
+                    (self.video_width, self.video_height),
+                )
+                if not writer.isOpened():
+                    writer.release()
+                    raise RuntimeError("OpenCV could not open MP4 video writer")
+                try:
+                    for frame_path in self._video_frame_paths:
+                        bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+                        if bgr is None or bgr.shape[:2] != (
+                                self.video_height, self.video_width):
+                            raise RuntimeError("invalid composed video frame")
+                        writer.write(bgr)
+                finally:
+                    writer.release()
+                self._run_meta["video_path"] = str(video_path)
+                self._run_meta["video_resolution"] = [self.video_width, self.video_height]
+                self._run_meta["video_fps"] = self.fps
+                self._run_meta["video_frame_count"] = len(self._video_frame_paths)
+                self._run_meta["video_duration_seconds"] = len(self._video_frame_paths) / self.fps
+                self.recording_status = (
+                    "partial" if self.recording_error is not None else "complete"
+                )
+            except Exception as exc:
+                video_path = None
+                self._set_recording_error(exc)
+        if self._episode_summary is not None:
+            # This canonical write is deliberately outside the video exception
+            # handler so a core-record failure cannot be relabeled as recording.
+            self.update_summary(summary)
+        return video_path
 
     def close(self):
         if not self._log_file.closed:

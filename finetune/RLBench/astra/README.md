@@ -83,7 +83,10 @@ model/service fields null or not applicable.
 
 The inspected Codex CLI is version `0.157.1` in the implementation environment.
 It supports the model, reasoning, read-only sandbox, JSON event, schema, and
-last-message options used here. Its help exposes no verified switch that
+last-message options used here. Each image is passed as its own repeated
+`-i <path>` pair, in front, left-shoulder, right-shoulder, wrist order; the
+instruction remains the final prompt argument. The final argv is covered by a
+fake CLI test with spaces and non-ASCII path characters. Its help exposes no verified switch that
 disables tools. The evaluator rejects tool-use events before accepting an
 action, but this is post-hoc detection, not strong tool isolation. The CLI
 uses a temporary working directory outside the repository and checks the
@@ -142,25 +145,68 @@ nonstandard; formal mode disallows that option. If `rlbench` or `pyrep` has
 already been imported from the wrong location, the evaluator asks for a fresh
 process instead of changing paths and continuing.
 
+Each run defaults to `<repository-root>/outputs/astra_<evaluation-id>`,
+regardless of the launch directory. `--output-root` explicitly changes the
+root; `--codex-work-root` and `--log-file` explicitly override their paths.
+Any override that moves artifacts outside the default unified layout prints a
+startup warning and is listed in the manifest. The default Codex CLI working directory is a
+separate empty temporary directory outside the repository and is removed when
+the CLI call ends; persistent policy evidence stays under this run directory.
+
 Each run creates:
 
 ```text
-<output-root>/<evaluation-id>/
+outputs/astra_<evaluation-id>/
   run_manifest.json       # resolved protocol, code/dependency/model identity
   run_summary.json        # episode/task/repeat aggregates
-  run.jsonl               # step and summary events (unless --log-file overrides it)
+  run.jsonl               # step and summary events
+  policy_work/             # Codex CLI inputs and bounded failure evidence
   episodes/<episode-run>/
     episode_summary.json
     episode_log.jsonl
     run_meta.json
-    steps/step_NNN/       # raw model RGB, policy/action metadata, execution record
-    video/                 # composite video and intermediate frames when enabled
+    steps/step_NNN/        # policy RGB, accepted/rejected action, execution record
+    video/                 # optional composite video and intermediate frames
 ```
 
-Run manifests avoid complete environment dumps and credentials. Episode results
-are written before MP4 encoding. If MP4 setup, rendering, image I/O, or encoding
-fails, `recording_error` is saved while the episode result remains available.
-If a result file itself cannot be written, the run fails visibly.
+The manifest's planned unit order matches evaluator execution order (task,
+repeat, episode). Aggregate successes and denominators both use the same
+evaluable episode rows. Infrastructure, unknown, missing, duplicate, or
+conflicting rows make coverage incomplete; a success with `evaluable=false`
+is excluded and reported as a data conflict. Sanity checks never enter the
+five-task macro average, and incomplete repeats are not presented as complete
+repeat means.
+
+Policy output validation, tool-use rejection, inference deadlines, model or
+CLI service errors, simulator errors, core artifact write errors, and unknown
+errors use typed categories and error codes. Rejected model output is stored
+separately from accepted actions; only allowlisted action fields are retained
+when safe. Event and stderr evidence is bounded and redacted, with truncation
+and redaction status recorded. Raw model output and hidden reasoning are not
+stored. If safe redaction fails, the original diagnostic text is omitted.
+
+Core records include policy inputs and metadata, the per-step canonical
+`execution.json`, `episode_summary.json`, `run_manifest.json`, and
+`run_summary.json`. A failed core write raises an evaluation error and leaves
+the run incomplete where the remaining storage permits. `execution.json` and
+`episode_summary.json` are the per-step and per-episode authoritative records;
+`episode_log.jsonl` and `run_meta.json` are redundant convenience records.
+Failures in `episode_log.jsonl` and `run_meta.json` are listed in the
+authoritative episode summary. `run.jsonl` is also a convenience event stream;
+write failures are retained in the run summary. Camera captures, annotated
+frames, and MP4 encoding are optional visualization; their failures set
+`recording_error` without changing a saved task result. Episode results are
+committed before video encoding.
+
+There is no environment execution watchdog in this revision. The current
+evaluator owns a live RLBench/PyRep environment and invokes planner/IK and
+simulator calls synchronously. A timer or worker thread would leave a blocked
+native call running against that environment; a reliable deadline needs a
+supervised process architecture that can terminate the simulator-owning
+execution context and then persist an incomplete episode from outside it.
+That boundary has not been implemented or validated, so environment steps can
+still block indefinitely. The existing `--codex-timeout` applies only to the
+Codex CLI inference process and does not cover `eval_env.step()`.
 
 ## Commands
 
@@ -177,7 +223,7 @@ bash eval_astra.sh \
   --policy mock --run-mode debug --tasks stack_cups \
   --budget-protocol uniform25 --eval-episodes 1 --repeats 1 \
   --start-episode 0 --max-waypoints 2 --collision-mode fixed0 \
-  --no-record-video --output-root outputs/astra_debug
+  --no-record-video
 ```
 
 `meat_off_grill` sanity check with the real model configuration (this command
@@ -190,7 +236,7 @@ bash eval_astra.sh \
   --budget-protocol uniform25 --eval-episodes 1 --repeats 1 \
   --start-episode 0 --max-waypoints 25 --collision-mode fixed0 \
   --codex-model gpt-6-luna --codex-reasoning max \
-  --output-root outputs/astra_meat_off_grill_smoke
+  --no-record-video
 ```
 
 Formal five-task command (documented only; do not use it for a smoke test):
@@ -202,9 +248,11 @@ bash eval_astra.sh \
   --tasks place_cups place_shape_in_shape_sorter put_groceries_in_cupboard stack_blocks stack_cups \
   --budget-protocol repo_step_limits \
   --eval-episodes 25 --repeats 5 --start-episode 0 \
-  --collision-mode fixed0 --codex-model gpt-6-luna --codex-reasoning max \
-  --output-root outputs/astra_formal
+  --collision-mode fixed0 --codex-model gpt-6-luna --codex-reasoning max
 ```
 
-The smoke command is one debug episode, not a success-rate estimate. The
-evaluator does not automatically retry it or launch the formal batch.
+The Codex and formal commands are documentation for a later real-run stage and
+were not executed in this code/fake-verification round. No real model or
+simulator closed loop has been validated. This revision still has no history
+input, cross-step session, or online adaptation. The evaluator does not
+automatically retry episodes or launch a formal batch.
