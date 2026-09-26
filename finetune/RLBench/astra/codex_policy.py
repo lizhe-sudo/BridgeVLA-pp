@@ -18,6 +18,9 @@ from PIL import Image
 from .policy import AstraPolicy
 from .schemas import AstraAction, AstraObservation
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_WORK_ROOT = REPO_ROOT / "tmp" / "rlbench_codex_policy"
+
 
 class CodexAstraPolicyError(RuntimeError):
     """Raised when Codex cannot produce a safe, valid structured action."""
@@ -56,7 +59,7 @@ class CodexAstraPolicy(AstraPolicy):
         model: str = "gpt-6-luna",
         reasoning_effort: str = "max",
         timeout: float = 180.0,
-        work_root: str = "/tmp/rlbench_codex_policy",
+        work_root: Optional[str] = None,
     ):
         if not model:
             raise ValueError("Codex model must be non-empty")
@@ -68,7 +71,11 @@ class CodexAstraPolicy(AstraPolicy):
         self.model = str(model)
         self.reasoning_effort = str(reasoning_effort)
         self.timeout = float(timeout)
-        self.work_root = Path(work_root).expanduser().absolute()
+        self.work_root = (
+            Path(work_root).expanduser().absolute()
+            if work_root is not None
+            else DEFAULT_WORK_ROOT
+        )
         self.work_root.mkdir(parents=True, exist_ok=True)
         self.last_metadata = None
         self._instruction = ""
@@ -278,7 +285,11 @@ class CodexAstraPolicy(AstraPolicy):
             "codex_working_directory": None,
         }
 
-        with tempfile.TemporaryDirectory(prefix="rlbench_codex_cwd_", dir="/tmp") as cwd:
+        cwd_root = self.work_root / "codex_cwd"
+        cwd_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rlbench_codex_cwd_", dir=str(cwd_root)
+        ) as cwd:
             metadata["codex_working_directory"] = cwd
             if os.listdir(cwd):
                 raise CodexAstraPolicyError("Codex working directory is not empty")

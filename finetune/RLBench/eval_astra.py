@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FINETUNE_DIR = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(FINETUNE_DIR)
 
 
 def _add_project_paths():
@@ -77,7 +78,8 @@ def _build_parser():
     parser.add_argument("--codex-timeout", type=float, default=180.0,
                         help="Codex CLI timeout in seconds (default: 180)")
     parser.add_argument(
-        "--codex-work-root", default="/tmp/rlbench_codex_policy",
+        "--codex-work-root",
+        default=os.path.join(REPO_ROOT, "tmp", "rlbench_codex_policy"),
         help="directory for per-episode Codex inference artifacts",
     )
     parser.add_argument("--log-file", default=None,

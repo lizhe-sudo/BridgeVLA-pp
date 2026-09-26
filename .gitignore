@@ -89,6 +89,7 @@ CMakeCache.txt
 
 # ===== Local scratch =====
 *.tmp
+/tmp/
 tmp/
 scratch/
 
