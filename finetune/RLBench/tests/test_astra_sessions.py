@@ -28,6 +28,7 @@ log_path = os.environ["ASTRA_FAKE_LOG"]
 thread_id = "thread-" + uuid.uuid4().hex
 session_id = "session-" + uuid.uuid4().hex
 turn_count = 0
+experimental_api = False
 
 def send(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -35,6 +36,9 @@ def send(value):
 
 def response(request_id, result=None):
     send({"id": request_id, "result": result or {}})
+
+def rpc_error(request_id, code, message):
+    send({"id": request_id, "error": {"code": code, "message": message}})
 
 def notification(method, params):
     send({"method": method, "params": params})
@@ -50,10 +54,29 @@ for line in sys.stdin:
     params = request.get("params", {})
     request_id = request.get("id")
     if method == "initialize":
+        capabilities = params.get("capabilities")
+        experimental_api = (
+            isinstance(capabilities, dict)
+            and capabilities.get("experimentalApi") is True
+        )
         response(request_id, {"serverInfo": {"name": "fake", "version": "1"}})
     elif method == "initialized":
         pass
     elif method == "thread/start":
+        if "runtimeWorkspaceRoots" in params and not experimental_api:
+            rpc_error(
+                request_id, -32602,
+                "thread/start.runtimeWorkspaceRoots requires experimentalApi capability",
+            )
+            continue
+        if (params.get("dynamicTools") != [] or params.get("environments") != []
+                or params.get("sandbox") != "read-only"
+                or params.get("approvalPolicy") != "never"):
+            rpc_error(request_id, -32602, "unsafe thread/start configuration")
+            continue
+        if mode == "thread_start_rejected":
+            rpc_error(request_id, -32011, "controlled thread/start rejection")
+            continue
         thread = {"id": thread_id, "sessionId": session_id, "ephemeral": False}
         if mode == "missing_session_id":
             thread.pop("sessionId")
@@ -244,16 +267,36 @@ class FakeAppServerTests(unittest.TestCase):
             turns = [row for row in requests if row.get("method") == "turn/start"]
             self.assertEqual(len(starts), 1)
             self.assertEqual(len(turns), 3)
+            initialize = next(row for row in requests
+                              if row.get("method") == "initialize")
+            self.assertEqual(
+                initialize["params"]["capabilities"], {"experimentalApi": True}
+            )
+            self.assertEqual(session.app_server_capabilities,
+                             {"experimentalApi": True})
             self.assertFalse(starts[0]["params"]["ephemeral"])
+            self.assertEqual(starts[0]["params"]["runtimeWorkspaceRoots"], [])
+            self.assertEqual(starts[0]["params"]["dynamicTools"], [])
+            self.assertEqual(starts[0]["params"]["environments"], [])
+            self.assertEqual(starts[0]["params"]["sandbox"], "read-only")
+            self.assertEqual(starts[0]["params"]["approvalPolicy"], "never")
+            self.assertEqual(session.thread_start_request_metadata["params"][
+                "developerInstructions"]["redacted"], True)
             self.assertNotIn("--last", starts[0].get("argv", []))
             self.assertTrue(all(row["params"]["threadId"] == session.thread_id
                                 for row in turns))
             for index, request in enumerate(turns):
                 self.assertEqual(request["params"]["effort"], "max")
                 self.assertEqual(request["params"]["model"], "gpt-6-luna")
+                self.assertEqual(request["params"]["approvalPolicy"], "never")
+                self.assertEqual(request["params"]["cwd"], str(self.cwd))
                 self.assertEqual(request["params"]["outputSchema"], self.schema())
                 self.assertEqual(request["params"]["input"][0]["text"],
                                  f"current step {index}")
+                self.assertEqual(
+                    [item["type"] for item in request["params"]["input"][1:]],
+                    ["localImage"] * 4,
+                )
                 self.assertEqual(
                     [item["path"].split("/")[-1]
                      for item in request["params"]["input"][1:]],
@@ -266,6 +309,123 @@ class FakeAppServerTests(unittest.TestCase):
         finally:
             session.close()
         self.assertTrue(session.process_group_exit_confirmed)
+
+    def test_experimental_thread_start_fields_require_negotiated_capability(self):
+        session = CodexAppServerSession(
+            self.executable, self.cwd, "gpt-6-luna", "max", 2,
+            experimental_api=False,
+        )
+        try:
+            with self.assertRaisesRegex(ModelServiceError, "requires experimentalApi"):
+                session.create_thread("isolated test thread")
+            requests = self.protocol()
+            initialize = next(row for row in requests
+                              if row.get("method") == "initialize")
+            start = next(row for row in requests
+                         if row.get("method") == "thread/start")
+            self.assertEqual(
+                initialize["params"]["capabilities"]["experimentalApi"], False
+            )
+            self.assertIn("runtimeWorkspaceRoots", start["params"])
+            self.assertEqual(session.last_protocol_error["protocol_error_code"], -32602)
+            self.assertEqual(session.last_protocol_error["method"], "thread/start")
+            self.assertIn("requires experimentalApi",
+                          session.last_protocol_error["error_summary"])
+            self.assertIsNone(session.thread_id)
+            self.assertEqual(session.turn_count, 0)
+            self.assertNotIn("turn/start", [row.get("method") for row in requests])
+            self.assertTrue(session.failed)
+        finally:
+            session.close(force=True)
+        self.assertTrue(session.process_group_exit_confirmed)
+
+    def test_real_session_preflight_uses_production_fields_and_never_starts_turn(self):
+        from astra.app_server_preflight import run_preflight
+
+        output_path = self.root / "preflight-result.json"
+        result = run_preflight(
+            output_path, model="gpt-6-luna", reasoning_effort="max",
+            timeout=2, executable=str(self.executable),
+        )
+        self.assertEqual(result["status"], "thread_created_no_turn")
+        self.assertEqual(result["codex_cli_version"], "codex-cli 0.157.1-fake")
+        self.assertEqual(result["app_server_capabilities"],
+                         {"experimentalApi": True})
+        self.assertEqual(result["control_turn_count"], 0)
+        self.assertFalse(result["turn_start_called"])
+        self.assertFalse(result["inference_or_model_request_performed"])
+        self.assertTrue(result["thread_id_present_and_verified"])
+        self.assertTrue(result["session_id_present_and_verified"])
+        self.assertTrue(result["process_group_exit_confirmed"])
+        self.assertEqual(result["process_pid"], result["process_group_id"])
+        self.assertTrue(result["isolated_working_directory_removed"])
+        requests = self.protocol()
+        self.assertEqual([row.get("method") for row in requests],
+                         ["initialize", "initialized", "thread/start"])
+        self.assertNotIn("turn/start", [row.get("method") for row in requests])
+        start = requests[-1]["params"]
+        self.assertEqual(start["runtimeWorkspaceRoots"], [])
+        self.assertEqual(start["dynamicTools"], [])
+        self.assertEqual(start["environments"], [])
+        self.assertEqual(start["sandbox"], "read-only")
+        self.assertEqual(start["approvalPolicy"], "never")
+        saved = json.loads(output_path.read_text())
+        self.assertEqual(saved["status"], "thread_created_no_turn")
+        self.assertNotIn("thread-", output_path.read_text())
+        self.assertNotIn("session-", output_path.read_text())
+        with self.assertRaises(FileExistsError):
+            run_preflight(
+                output_path, model="gpt-6-luna", reasoning_effort="max",
+                timeout=2, executable=str(self.executable),
+            )
+
+    def test_thread_start_rejection_is_infrastructure_error_without_action(self):
+        from astra.codex_policy import CodexAstraPolicy
+
+        which_patch = mock.patch(
+            "astra.codex_policy.shutil.which", return_value=str(self.executable)
+        )
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
+        policy = CodexAstraPolicy(
+            model="gpt-6-luna", reasoning_effort="max", timeout=2,
+            work_root=str(self.root / "thread start rejected"), collision_mode="fixed0",
+        )
+        policy.set_evaluation_context("eval-thread-start-failure", 1,
+                                      "open_drawer", 0, 25)
+        policy.reset("Open the drawer.")
+        images = {name: np.zeros((8, 8, 3), dtype=np.uint8)
+                  for name in CodexAstraPolicy.IMAGE_FIELDS}
+        observation = AstraObservation(
+            "Open the drawer.", images, [0, 0, 0, 0, 0, 0, 1], True,
+        )
+        try:
+            with mock.patch.dict(os.environ, {
+                    "ASTRA_FAKE_MODE": "thread_start_rejected"}):
+                with self.assertRaises(ModelServiceError) as raised:
+                    policy.act(observation)
+            self.assertEqual(raised.exception.error_code, "app_server_request_failed")
+            requests = self.protocol()
+            self.assertEqual(
+                [row.get("method") for row in requests],
+                ["initialize", "initialized", "thread/start"],
+            )
+            self.assertTrue(policy._session.failed)
+            self.assertIsNone(policy._session.thread_id)
+            self.assertEqual(policy._session.turn_count, 0)
+            self.assertFalse(Path(policy.last_metadata["accepted_action_path"]).exists())
+            manifest = json.loads(policy._session_manifest_path.read_text())
+            self.assertEqual(manifest["app_server_capabilities"],
+                             {"experimentalApi": True})
+            self.assertEqual(manifest["thread_start_request"]["params"][
+                "runtimeWorkspaceRoots"], [])
+            self.assertEqual(manifest["last_protocol_error"]["protocol_error_code"],
+                             -32011)
+            self.assertIn("controlled thread/start rejection",
+                          manifest["last_protocol_error"]["error_summary"])
+        finally:
+            policy.close()
+        self.assertTrue(policy._session is None)
 
     def test_episode_sessions_get_distinct_ids_and_missing_id_fails_before_turn(self):
         first = self.new_session()

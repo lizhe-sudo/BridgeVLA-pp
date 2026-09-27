@@ -83,6 +83,12 @@ model, that field stays null. Mock and manual policies have no model identity.
 ### Episode-scoped native control session
 
 The backend is Codex App Server, verified locally with Codex CLI `0.157.1`.
+The connection opts into `capabilities.experimentalApi` because the thread
+request intentionally supplies `runtimeWorkspaceRoots: []`; a connection that
+declares that capability false is rejected by the installed server. The
+version-matched schema is generated with
+`codex app-server generate-json-schema --experimental --out <directory>`;
+the stable default export is not used to validate those experimental fields.
 The implementation performs the JSON-RPC `initialize` handshake, starts one
 non-ephemeral native thread with `thread/start`, and requires both the returned
 `thread.id` and `thread.sessionId`. It writes these IDs to the episode session
@@ -123,6 +129,32 @@ the deprecated `thread/compacted` notification, which is recorded when seen.
 Tool items remain rejected even in a turn that also compacts context. This is a
 narrow verified boundary, not a claim of complete isolation from all user-level
 or service-added context. The user's global Codex configuration is not changed.
+
+The thread request explicitly sends `runtimeWorkspaceRoots: []`,
+`dynamicTools: []`, `environments: []`, `sandbox: "read-only"`,
+`approvalPolicy: "never"`, and `ephemeral: false`. The installed schema accepts
+null/omitted values for several optional fields, which would leave their
+selection to protocol or server defaults; Astra sends explicit values instead.
+In particular, an empty environments array disables environment access while
+omitting it selects a default environment when that feature is enabled. Empty
+workspace roots replace the roots with none, and an empty dynamic-tools array
+declares no dynamic tool definitions. Enabling the App Server experimental API
+only negotiates protocol fields; it does not change the sandbox, approval,
+tools, or policy input rules.
+
+Before a real evaluator run, the same production session class can perform a
+thread-creation-only preflight without a simulator or `turn/start`:
+
+```bash
+PYTHONPATH=finetune/RLBench python -m astra.app_server_preflight \
+  --output outputs/astra_preflight_<unique>.json \
+  --model gpt-6-luna --reasoning max
+```
+
+The preflight records the CLI version, negotiated capability, redacted actual
+thread request fields, response identity validation, protocol errors, and
+process cleanup. Its success confirms only initialization and thread creation;
+it does not send a model request or validate model/reasoning availability.
 
 The first prompt contains the control rules, task instruction, measured pose,
 gripper state, step/budget, and the initial four images. Later turns add only
@@ -343,9 +375,9 @@ bash eval_astra.sh \
   --collision-mode fixed0 --codex-model gpt-6-luna --codex-reasoning max
 ```
 
-The real `open_drawer` command has not been run in this code/fake-verification
-round. Fake App Server protocol tests and the fake evaluator validate request
-identity, schema/image delivery, measured-feedback ordering, and new-thread
-behavior; they do not prove that a real model remembers earlier turns or that
-real 720p sensors render correctly in CoppeliaSim. The evaluator does not
-automatically retry episodes or launch a formal batch.
+Fake App Server protocol tests and thread-creation preflight validate request
+identity, negotiated fields, schema/image serialization, and process cleanup;
+they do not prove that a real model can complete a turn, remembers earlier
+turns, or that real 720p sensors render correctly in CoppeliaSim. Report each
+real run from its own manifest, episode records, and decoded video. The
+evaluator does not automatically retry episodes or launch a formal batch.

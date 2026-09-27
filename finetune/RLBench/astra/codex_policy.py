@@ -192,6 +192,22 @@ class CodexAstraPolicy(AstraPolicy):
             "app_server_info": (
                 self._session.app_server_info if self._session is not None else None
             ),
+            "app_server_capabilities": (
+                dict(self._session.app_server_capabilities)
+                if self._session is not None else None
+            ),
+            "thread_start_request": (
+                self._session.thread_start_request_metadata
+                if self._session is not None else None
+            ),
+            "thread_start_response": (
+                self._session.thread_start_response_metadata
+                if self._session is not None else None
+            ),
+            "last_protocol_error": (
+                self._session.last_protocol_error
+                if self._session is not None else None
+            ),
             "reasoning_effort": self.reasoning_effort,
             "created_at": self._session_started_at,
             "initialization_latency_seconds": (
@@ -854,6 +870,16 @@ class CodexAstraPolicy(AstraPolicy):
         except Exception as exc:
             self._active_metadata.update(safe_exception_record(exc))
             self._active_metadata["error"] = self._active_metadata["error_summary"]
+            if self._session is not None:
+                self._active_metadata.update({
+                    "thread_id": self._session.thread_id,
+                    "control_session_id": self._session.session_id,
+                    "app_server_capabilities": dict(
+                        self._session.app_server_capabilities
+                    ),
+                    "app_server_rpc_request_count": self._session.rpc_request_count,
+                    "control_turn_count": self._session.turn_count,
+                })
             self._active_metadata["raw_structured_output"] = None
             step_dir = self._active_metadata.get("step_dir")
             rejected_path = self._active_metadata.get("rejected_output_path")
@@ -871,6 +897,8 @@ class CodexAstraPolicy(AstraPolicy):
             if self._session is not None and isinstance(
                     exc, (InvalidPolicyOutput, PolicyToolViolation)):
                 self._session.failed = True
+                self._write_session_manifest("failed")
+            elif self._session is not None and self._session.failed:
                 self._write_session_manifest("failed")
             if (step_dir and self._active_metadata.get("turn_id")
                     and self._active_metadata.get("action_id")):

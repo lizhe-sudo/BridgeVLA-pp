@@ -6,6 +6,7 @@ and fails closed if App Server starts a tool item or loses the current turn.
 """
 
 import json
+import hashlib
 import os
 import selectors
 import signal
@@ -27,13 +28,15 @@ SAFE_ITEM_TYPES = {
     "developerMessage", "systemMessage", "contextCompaction",
 }
 SAFE_ITEM_DELTA_TYPES = {"agentMessage", "reasoning", "plan"}
+APP_SERVER_EXPERIMENTAL_API = True
 
 
 class CodexAppServerSession:
     """One App Server process and one newly created native thread."""
 
     def __init__(self, executable, cwd, model, reasoning_effort, timeout,
-                 process_factory=subprocess.Popen, monotonic=time.monotonic):
+                 process_factory=subprocess.Popen, monotonic=time.monotonic,
+                 experimental_api=APP_SERVER_EXPERIMENTAL_API):
         self.executable = str(executable)
         self.cwd = Path(cwd).resolve()
         self.model = str(model)
@@ -61,11 +64,34 @@ class CodexAppServerSession:
         self.turn_records = []
         self.context_compression_events = []
         self.last_turn_metadata = {}
+        if not isinstance(experimental_api, bool):
+            raise ValueError("experimental_api must be a boolean")
+        self.app_server_capabilities = {"experimentalApi": experimental_api}
+        self.initialized = False
+        self.thread_start_request_metadata = None
+        self.thread_start_response_metadata = None
+        self.last_protocol_error = None
 
-    @staticmethod
-    def _rpc_error(error, default_code):
+    def _rpc_error(self, error, default_code, method):
         message = error.get("message") if isinstance(error, dict) else None
         safe = sanitize_diagnostic(message if isinstance(message, str) else "")
+        protocol_code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(protocol_code, bool) or not isinstance(
+                protocol_code, (int, str)):
+            protocol_code = None
+        elif isinstance(protocol_code, str) and (
+                not protocol_code or len(protocol_code) > 80
+                or any(not (char.isalnum() or char in "_.-")
+                       for char in protocol_code)):
+            protocol_code = None
+        self.last_protocol_error = {
+            "method": method,
+            "protocol_error_code": protocol_code,
+            "error_code": default_code,
+            "error_summary": safe["text"],
+            "error_summary_truncated": safe["truncated"],
+            "error_summary_redaction_failed": safe["redaction_failed"],
+        }
         return ModelServiceError(
             safe["text"] or "Codex App Server request failed",
             error_code=default_code,
@@ -192,7 +218,7 @@ class CodexAppServerSession:
                     )
                 if "error" in message:
                     raise self._rpc_error(message["error"],
-                                          "app_server_request_failed")
+                                          "app_server_request_failed", method)
                 if "result" not in message or not isinstance(message["result"], dict):
                     raise ModelServiceError(
                         "Codex App Server returned a malformed request result",
@@ -213,6 +239,11 @@ class CodexAppServerSession:
         self._send({"method": method, "params": params})
 
     def _initialize(self):
+        if self.initialized:
+            raise ModelServiceError(
+                "Codex App Server connection was already initialized",
+                error_code="app_server_already_initialized",
+            )
         self._start()
         result = self._request("initialize", {
             "clientInfo": {
@@ -220,7 +251,7 @@ class CodexAppServerSession:
                 "title": "Astra RLBench episode controller",
                 "version": "1",
             },
-            "capabilities": {"experimentalApi": False},
+            "capabilities": dict(self.app_server_capabilities),
         })
         server_info = result.get("serverInfo")
         if isinstance(server_info, dict):
@@ -229,73 +260,125 @@ class CodexAppServerSession:
                 if key in ("name", "version") and isinstance(value, str)
             }
         self._notify("initialized", {})
+        self.initialized = True
+
+    def _thread_start_params(self, developer_instructions):
+        """Build the one canonical, schema-checked thread/start payload."""
+        return {
+            "model": self.model,
+            "allowProviderModelFallback": False,
+            "cwd": str(self.cwd),
+            "runtimeWorkspaceRoots": [],
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "ephemeral": False,
+            "developerInstructions": str(developer_instructions),
+            "dynamicTools": [],
+            "environments": [],
+            "serviceName": "astra_rlbench_eval",
+        }
+
+    @staticmethod
+    def _safe_thread_start_request(params):
+        """Record wire fields and safe values without persisting instructions."""
+        recorded = dict(params)
+        instructions = recorded.get("developerInstructions")
+        if isinstance(instructions, str):
+            encoded = instructions.encode("utf-8")
+            recorded["developerInstructions"] = {
+                "redacted": True,
+                "utf8_byte_length": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            }
+        return {"fields": list(params), "params": recorded}
 
     def create_thread(self, developer_instructions):
         if self.failed or self.closed:
             raise ModelServiceError("Codex control session is not usable",
                                     error_code="control_session_unusable")
+        if self.initialized or self.thread_id:
+            self.failed = True
+            raise ModelServiceError(
+                "Codex App Server connection cannot initialize or create a second thread",
+                error_code="app_server_thread_already_started",
+            )
         initialized_at = self.monotonic()
         try:
-            self._initialize()
-            result = self._request("thread/start", {
-                "model": self.model,
-                "allowProviderModelFallback": False,
-                "cwd": str(self.cwd),
-                "runtimeWorkspaceRoots": [],
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "ephemeral": False,
-                "developerInstructions": str(developer_instructions),
-                "dynamicTools": [],
-                "environments": [],
-                "serviceName": "astra_rlbench_eval",
-            })
-        finally:
-            self.initialization_latency_seconds = max(
-                0.0, self.monotonic() - initialized_at
-            )
-        thread = result.get("thread")
-        if not isinstance(thread, dict):
+            try:
+                self._initialize()
+                params = self._thread_start_params(developer_instructions)
+                self.thread_start_request_metadata = self._safe_thread_start_request(
+                    params
+                )
+                result = self._request("thread/start", params)
+            finally:
+                self.initialization_latency_seconds = max(
+                    0.0, self.monotonic() - initialized_at
+                )
+            thread = result.get("thread")
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            session_id = thread.get("sessionId") if isinstance(thread, dict) else None
+            instruction_sources = result.get("instructionSources")
+            model = result.get("model")
+            self.thread_start_response_metadata = {
+                "thread_id_present": (
+                    isinstance(thread_id, str) and bool(thread_id.strip())
+                ),
+                "session_id_present": (
+                    isinstance(session_id, str) and bool(session_id.strip())
+                ),
+                "ephemeral": (
+                    thread.get("ephemeral") if isinstance(thread, dict)
+                    and isinstance(thread.get("ephemeral"), bool) else None
+                ),
+                "response_model": model if isinstance(model, str) else None,
+                "instruction_sources_present": isinstance(instruction_sources, list),
+                "instruction_sources_count": (
+                    len(instruction_sources)
+                    if isinstance(instruction_sources, list) else None
+                ),
+            }
+            if not isinstance(thread, dict):
+                raise ModelServiceError("thread/start did not return a thread",
+                                        error_code="thread_identity_missing")
+            if (not isinstance(thread_id, str) or not thread_id.strip()
+                    or not isinstance(session_id, str) or not session_id.strip()):
+                raise ModelServiceError(
+                    "thread/start did not return both thread.id and thread.sessionId",
+                    error_code="thread_identity_missing",
+                )
+            if isinstance(thread.get("ephemeral"), bool) and thread["ephemeral"]:
+                raise ModelServiceError(
+                    "thread/start returned an ephemeral thread when durable was requested",
+                    error_code="thread_ephemeral_mismatch",
+                )
+            if not isinstance(instruction_sources, list):
+                raise ModelServiceError("thread instruction sources were missing or malformed",
+                                        error_code="thread_context_unverified")
+            if instruction_sources:
+                raise ModelServiceError(
+                    "Codex control working directory loaded instruction files",
+                    error_code="inherited_codex_context",
+                )
+            self.thread_id = thread_id
+            self.session_id = session_id
+            if isinstance(model, str) and model.strip():
+                self.resolved_model = model.strip()
+            self.instruction_sources = instruction_sources
+            return {
+                "thread_id": self.thread_id,
+                "session_id": self.session_id,
+                "resolved_model": self.resolved_model,
+                "app_server_info": self.app_server_info,
+                "instruction_sources": list(instruction_sources),
+                "native_session_id": thread.get("sessionId"),
+                "ephemeral": thread.get("ephemeral"),
+                "thread_start_response_model": model,
+                "initialization_latency_seconds": self.initialization_latency_seconds,
+            }
+        except Exception:
             self.failed = True
-            raise ModelServiceError("thread/start did not return a thread",
-                                    error_code="thread_identity_missing")
-        thread_id = thread.get("id")
-        session_id = thread.get("sessionId")
-        if (not isinstance(thread_id, str) or not thread_id.strip()
-                or not isinstance(session_id, str) or not session_id.strip()):
-            self.failed = True
-            raise ModelServiceError(
-                "thread/start did not return both thread.id and thread.sessionId",
-                error_code="thread_identity_missing",
-            )
-        instruction_sources = result.get("instructionSources")
-        if not isinstance(instruction_sources, list):
-            self.failed = True
-            raise ModelServiceError("thread instruction sources were missing or malformed",
-                                    error_code="thread_context_unverified")
-        if instruction_sources:
-            self.failed = True
-            raise ModelServiceError(
-                "Codex control working directory loaded instruction files",
-                error_code="inherited_codex_context",
-            )
-        self.thread_id = thread_id
-        self.session_id = session_id
-        model = result.get("model")
-        if isinstance(model, str) and model.strip():
-            self.resolved_model = model.strip()
-        self.instruction_sources = instruction_sources
-        return {
-            "thread_id": self.thread_id,
-            "session_id": self.session_id,
-            "resolved_model": self.resolved_model,
-            "app_server_info": self.app_server_info,
-            "instruction_sources": list(instruction_sources),
-            "native_session_id": thread.get("sessionId"),
-            "ephemeral": thread.get("ephemeral"),
-            "thread_start_response_model": model,
-            "initialization_latency_seconds": self.initialization_latency_seconds,
-        }
+            raise
 
     @staticmethod
     def _item_type(message):
