@@ -195,6 +195,101 @@ a reason grounded in new observations.
 
 Return exactly one next absolute target in the required action schema."""
 
+INTERFACE_GROUNDED_V1_INITIAL_TEMPLATE = """You control the robot described in ROBOT INTERFACE.
+Complete TASK INSTRUCTION within the available action budget.
+Determine the actions and their order yourself.
+
+This conversation belongs to one episode.
+At each turn, return exactly one absolute end-effector target.
+The evaluator executes it, then provides a new observation and measured
+feedback before the next turn.
+
+ROBOT INTERFACE
+
+{robot_interface_notes}
+
+GENERAL CONTROL PRINCIPLES
+
+Base the next target on the current measured state.
+Use the conversation history to interpret previous outcomes, but revise
+earlier assumptions when new measurements or images contradict them.
+
+Combine the available views. Camera names identify sensors, not object
+orientations or world-axis directions. Account for wrist-camera motion
+when interpreting image changes.
+
+For the initial action, prefer a small translation of approximately
+0.01 m or less when supported by the observed clearance.
+Prefer to preserve the measured orientation and gripper state during
+this initial exploration. These are behavioral preferences, not
+programmatic limits or guarantees of a collision-free path.
+
+Adapt translation and rotation to the available evidence.
+Use smaller changes when the geometry or execution response is uncertain,
+and make purposeful progress when the observations support it.
+Treat successful motion as local evidence, not proof that a farther
+target or another orientation is feasible.
+
+Judge the measured physical effect, not merely whether a command returned.
+Use the numerical feedback together with the newest images to distinguish
+target tracking from task progress.
+
+Choose actions that advance the task or resolve uncertainty that is
+preventing progress. Reconsider unproductive actions instead of repeating
+them without new evidence.
+
+Use only the observations and feedback supplied in this control
+conversation. Do not use tools, inspect files, consult demonstrations,
+or access external information.
+
+Return only the structured action required by the output schema.
+Do not add plans, explanations, or extra fields.
+
+CURRENT EPISODE
+
+TASK INSTRUCTION: {task_instruction}
+Current step: {step_id}
+Remaining target-action budget: {remaining_budget}
+Current observation ID: {observation_id}
+Measured EEF position: {current_position}
+Measured EEF quaternion: {current_quaternion}
+Measured gripper state: {current_gripper_state}
+
+The four attached images are the CURRENT observation, in this order:
+1. front
+2. left_shoulder
+3. right_shoulder
+4. wrist"""
+
+INTERFACE_GROUNDED_V1_FOLLOWUP_TEMPLATE = """Continue the same task episode.
+
+TASK INSTRUCTION: {task_instruction}
+Current step: {step_id}
+Remaining target-action budget: {remaining_budget}
+
+MEASURED FEEDBACK FOR PREVIOUS ACTION
+{previous_execution_feedback}
+
+CURRENT OBSERVATION
+Observation ID: {observation_id}
+Measured EEF position: {current_position}
+Measured EEF quaternion: {current_quaternion}
+Measured gripper state: {current_gripper_state}
+
+The four newly attached images are the CURRENT:
+front, left_shoulder, right_shoulder, wrist.
+
+Use the measured outcome and current images to update your understanding.
+Choose one useful next target, with motion extent appropriate to the
+available evidence.
+
+Return only the action JSON required by the output schema."""
+
+ROBOT_INTERFACE_NOTES_VERSION = "panda_rlbench_interface_v1"
+ROBOT_INTERFACE_NOTES_PATH = Path(__file__).with_name(
+    "robot_interface_notes_v1.txt"
+)
+
 APPLICATION_DEVELOPER_INSTRUCTIONS = (
     "You are a controller for one RLBench robot task episode. Follow only "
     "the control instructions and observations supplied in this thread. "
@@ -240,6 +335,9 @@ class CodexAstraPolicy(AstraPolicy):
         work_root: Optional[str] = None,
         collision_mode: str = "fixed0",
         motion_prompt_profile: str = "adaptive_small_steps",
+        position_tolerance_m: float = 0.01,
+        orientation_tolerance_deg: float = 5.0,
+        robot_interface_configuration=None,
     ):
         if not model:
             raise ValueError("Codex model must be non-empty")
@@ -254,12 +352,35 @@ class CodexAstraPolicy(AstraPolicy):
             raise ValueError("collision_mode must be fixed0, fixed1, or predict")
         self.collision_mode = collision_mode
         if motion_prompt_profile not in (
-                "adaptive_small_steps", "general_closed_loop_v1"):
+                "adaptive_small_steps", "general_closed_loop_v1",
+                "interface_grounded_v1"):
             raise ValueError(
-                "motion_prompt_profile must be adaptive_small_steps or "
-                "general_closed_loop_v1"
+                "motion_prompt_profile must be adaptive_small_steps, "
+                "general_closed_loop_v1, or interface_grounded_v1"
             )
         self.motion_prompt_profile = motion_prompt_profile
+        self.position_tolerance_m = float(position_tolerance_m)
+        self.orientation_tolerance_deg = float(orientation_tolerance_deg)
+        if (not math.isfinite(self.position_tolerance_m)
+                or not math.isfinite(self.orientation_tolerance_deg)
+                or self.position_tolerance_m <= 0
+                or self.orientation_tolerance_deg <= 0):
+            raise ValueError("pose diagnostic tolerances must be positive and finite")
+        self.robot_interface_configuration = (
+            dict(robot_interface_configuration)
+            if isinstance(robot_interface_configuration, dict)
+            else None
+        )
+        self._robot_interface_notes_template = None
+        self._robot_interface_notes = None
+        if self.motion_prompt_profile == "interface_grounded_v1":
+            self._robot_interface_notes_template = self._load_robot_interface_notes_template()
+            self._robot_interface_notes = self.render_robot_interface_notes(
+                self._robot_interface_notes_template,
+                self.collision_mode,
+                self.position_tolerance_m,
+                self.orientation_tolerance_deg,
+            )
         self._developer_instructions = APPLICATION_DEVELOPER_INSTRUCTIONS
         self.timeout = float(timeout)
         if work_root is None:
@@ -294,15 +415,21 @@ class CodexAstraPolicy(AstraPolicy):
 
     @staticmethod
     def prompt_profile_metadata(profile):
-        if profile not in ("adaptive_small_steps", "general_closed_loop_v1"):
+        if profile not in (
+                "adaptive_small_steps", "general_closed_loop_v1",
+                "interface_grounded_v1"):
             raise ValueError("unsupported motion prompt profile")
-        templates = (
-            {
+        templates_by_profile = {
+            "general_closed_loop_v1": {
                 "first_turn": GENERAL_CLOSED_LOOP_V1_INITIAL_TEMPLATE,
                 "followup_turn": GENERAL_CLOSED_LOOP_V1_FOLLOWUP_TEMPLATE,
-            }
-            if profile == "general_closed_loop_v1" else {}
-        )
+            },
+            "interface_grounded_v1": {
+                "first_turn": INTERFACE_GROUNDED_V1_INITIAL_TEMPLATE,
+                "followup_turn": INTERFACE_GROUNDED_V1_FOLLOWUP_TEMPLATE,
+            },
+        }
+        templates = templates_by_profile.get(profile, {})
         return {
             "motion_prompt_profile": profile,
             "prompt_template_version": profile,
@@ -314,13 +441,105 @@ class CodexAstraPolicy(AstraPolicy):
 
     def prompt_artifact_metadata(self):
         developer_bytes = self._developer_instructions.encode("utf-8")
-        return {
+        metadata = {
             **self.prompt_profile_metadata(self.motion_prompt_profile),
             "application_developer_instructions": self._developer_instructions,
             "application_developer_instructions_sha256": hashlib.sha256(
                 developer_bytes
             ).hexdigest(),
         }
+        if self.motion_prompt_profile == "interface_grounded_v1":
+            notes_template_bytes = self._robot_interface_notes_template.encode("utf-8")
+            notes_bytes = self._robot_interface_notes.encode("utf-8")
+            runtime_configuration = self.robot_interface_configuration
+            config_json = json.dumps(
+                runtime_configuration, sort_keys=True, ensure_ascii=False,
+                separators=(",", ":"), allow_nan=False,
+            ) if runtime_configuration is not None else None
+            metadata.update({
+                "robot_interface_notes_version": ROBOT_INTERFACE_NOTES_VERSION,
+                "robot_interface_notes_template_sha256": hashlib.sha256(
+                    notes_template_bytes
+                ).hexdigest(),
+                "robot_interface_notes_sha256": hashlib.sha256(notes_bytes).hexdigest(),
+                "robot_interface_notes": self._robot_interface_notes,
+                "robot_interface_configuration": runtime_configuration,
+                "robot_interface_configuration_sha256": (
+                    hashlib.sha256(config_json.encode("utf-8")).hexdigest()
+                    if config_json is not None else None
+                ),
+                "robot_interface_diagnostic_thresholds": {
+                    "position_tolerance_m": self.position_tolerance_m,
+                    "orientation_tolerance_deg": self.orientation_tolerance_deg,
+                },
+            })
+        return metadata
+
+    @staticmethod
+    def _load_robot_interface_notes_template():
+        try:
+            return ROBOT_INTERFACE_NOTES_PATH.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(
+                "interface_grounded_v1 robot-interface notes are unavailable"
+            ) from exc
+
+    @staticmethod
+    def _collision_interface_note(collision_mode):
+        if collision_mode == "fixed0":
+            behavior = (
+                "The evaluator supplies ignore_collisions=0. If the arm is already "
+                "colliding, this planner can disable collision participation for "
+                "some colliding non-robot shapes, and this action-mode path does "
+                "not restore those flags before returning. If a path search raises "
+                "ConfigurationPathError, it retries once with "
+                "ignore_collisions=True. fixed0 therefore does not guarantee that "
+                "collisions are checked throughout the action. In fixed modes the "
+                "evaluator supplies this field and the policy schema omits it."
+            )
+        elif collision_mode == "fixed1":
+            behavior = (
+                "The evaluator supplies ignore_collisions=1 to the installed "
+                "planner. In fixed modes the evaluator supplies this field and "
+                "the policy schema omits it."
+            )
+        elif collision_mode == "predict":
+            behavior = (
+                "The action schema includes ignore_collisions. Value 0 uses the "
+                "planner's collision-sensitive path, which may disable some "
+                "colliding shapes when the arm already collides (those flags are "
+                "not restored by this action-mode path) and may retry a failed "
+                "search once with ignore_collisions=True; value 1 starts "
+                "with collision checks ignored."
+            )
+        else:
+            raise ValueError("unsupported collision mode for robot-interface notes")
+        return f"{collision_mode}: {behavior}"
+
+    @classmethod
+    def render_robot_interface_notes(cls, template, collision_mode,
+                                     position_tolerance_m,
+                                     orientation_tolerance_deg):
+        replacements = {
+            "{{COLLISION_CONFIGURATION}}": cls._collision_interface_note(
+                collision_mode
+            ),
+            "{{POSITION_TOLERANCE_M}}": format(float(position_tolerance_m), ".12g"),
+            "{{ORIENTATION_TOLERANCE_DEG}}": format(
+                float(orientation_tolerance_deg), ".12g"
+            ),
+        }
+        rendered = str(template)
+        for marker, value in replacements.items():
+            if rendered.count(marker) != 1:
+                raise ValueError(
+                    "robot-interface notes template is missing or duplicates "
+                    f"required marker {marker}"
+                )
+            rendered = rendered.replace(marker, value)
+        if "{{" in rendered or "}}" in rendered:
+            raise ValueError("robot-interface notes contain unresolved placeholders")
+        return rendered
 
     def _read_cli_version(self):
         codex = shutil.which("codex")
@@ -878,6 +1097,30 @@ class CodexAstraPolicy(AstraPolicy):
         remaining = max(0, int(identity.get("waypoint_budget") or 25)
                         - int(step_id))
         observation_id = self._observation_id(step_id)
+        if self.motion_prompt_profile == "interface_grounded_v1":
+            values = {
+                "robot_interface_notes": self._robot_interface_notes,
+                "task_instruction": instruction,
+                "step_id": int(step_id),
+                "remaining_budget": remaining,
+                "observation_id": observation_id,
+                "current_position": json.dumps(pose[:3]),
+                "current_quaternion": json.dumps(pose[3:7]),
+                "current_gripper_state": gripper_text,
+            }
+            if int(step_id) == 0:
+                template = INTERFACE_GROUNDED_V1_INITIAL_TEMPLATE
+            else:
+                if self._pending_feedback is None:
+                    raise ModelServiceError(
+                        "a later control turn has no completed-action feedback",
+                        error_code="missing_execution_feedback",
+                    )
+                values["previous_execution_feedback"] = json.dumps(
+                    self._pending_feedback, ensure_ascii=False, allow_nan=False
+                )
+                template = INTERFACE_GROUNDED_V1_FOLLOWUP_TEMPLATE
+            return template.format_map(values)
         if self.motion_prompt_profile == "general_closed_loop_v1":
             values = {
                 "task_instruction": instruction,
@@ -1072,19 +1315,31 @@ class CodexAstraPolicy(AstraPolicy):
             if self.collision_mode == "predict":
                 return (
                     "Collision mode is predict. Include ignore_collisions as an "
-                    "integer: 0 keeps collision checking enabled; 1 asks the "
-                    "existing planner to ignore collisions."
+                    "integer: 0 uses the planner's collision-sensitive path, "
+                    "which can disable some colliding shapes if the arm already "
+                    "collides and may retry one failed search with checks "
+                    "disabled; 1 asks the existing planner to ignore collisions."
                 )
             fixed_value = 0 if self.collision_mode == "fixed0" else 1
-            return (
-                f"Collision mode is {self.collision_mode}. The evaluator supplies "
-                f"ignore_collisions = {fixed_value} to the existing planner. Do not "
-                "include an ignore_collisions field in your output."
-            )
+            if fixed_value == 0:
+                details = (
+                    "The planner may disable some colliding shapes if the arm "
+                    "already collides; this action-mode path does not restore "
+                    "those flags. A failed path search may be retried once with "
+                    "collision checks disabled."
+                )
+            else:
+                details = "The initial path search asks the planner to ignore collisions."
+            return (f"Collision mode is {self.collision_mode}. The evaluator supplies "
+                    f"ignore_collisions = {fixed_value}. {details} Do not include "
+                    "an ignore_collisions field in your output.")
         if self.collision_mode == "predict":
             return (
-                "Also output ignore_collisions as an integer: 0 keeps collision "
-                "checking enabled; 1 asks the existing planner to ignore collisions."
+                "Also output ignore_collisions as an integer: 0 uses the planner's "
+                "collision-sensitive path, which can disable some colliding "
+                "shapes if the arm already collides (those flags are not restored "
+                "by this action-mode path) and may retry a failed search once with "
+                "checks disabled; 1 asks the existing planner to ignore collisions."
             )
         fixed_value = 0 if self.collision_mode == "fixed0" else 1
         return (
@@ -1227,9 +1482,9 @@ class CodexAstraPolicy(AstraPolicy):
             image_paths[camera] = str(image_path)
 
         prompt = self._make_prompt(observation, pose, step_id)
-        prompt_provenance = self.prompt_profile_metadata(
-            self.motion_prompt_profile
-        )
+        prompt_provenance = self.prompt_profile_metadata(self.motion_prompt_profile)
+        if self.motion_prompt_profile == "interface_grounded_v1":
+            prompt_provenance.update(self.prompt_artifact_metadata())
         prompt_provenance["prompt_sha256"] = hashlib.sha256(
             prompt.encode("utf-8")
         ).hexdigest()

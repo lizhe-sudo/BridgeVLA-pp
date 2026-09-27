@@ -100,7 +100,8 @@ def _build_parser():
     parser.add_argument("--session-mode", choices=("episode",), default="episode",
                         help="native Codex control thread lifetime (one thread per episode)")
     parser.add_argument("--motion-prompt-profile",
-                        choices=("adaptive_small_steps", "general_closed_loop_v1"),
+                        choices=("adaptive_small_steps", "general_closed_loop_v1",
+                                 "interface_grounded_v1"),
                         default="adaptive_small_steps",
                         help="prompt-only movement-size guidance")
     parser.add_argument("--recording-width", type=int, default=1280,
@@ -572,6 +573,10 @@ def run_eval(args):
         from astra.episode_recorder import EpisodeRecorder
         from astra.mock_policy import ManualPolicy, MockPolicy
         from astra.observation_adapter import AstraObservationAdapter
+        from astra.robot_interface import (
+            build_runtime_robot_interface_configuration,
+            verify_runtime_robot_interface_configuration,
+        )
         from astra.sim_paths import module_identity
         from astra.visualization import orientation_error_degrees
 
@@ -579,6 +584,7 @@ def run_eval(args):
         # work without CoppeliaSim, RLBench, or compiled PyRep extensions.
         import pyrep
         import rlbench
+        import rlbench.environment as rlbench_environment
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.backend import task as rlbench_task
         from rlbench.backend.utils import task_file_to_task_class
@@ -637,6 +643,18 @@ def run_eval(args):
             task_classes.append(task_file_to_task_class(task_name))
 
         manual_action = _parse_manual_action(args.manual_action)
+        action_mode = MoveArmThenGripper2(
+            EndEffectorPoseViaPlanning2(), Discrete()
+        )
+        robot_interface_configuration = None
+        if (args.policy == "codex"
+                and args.motion_prompt_profile == "interface_grounded_v1"):
+            robot_interface_configuration = build_runtime_robot_interface_configuration(
+                rlbench, pyrep, rlbench_environment, action_mode
+            )
+            verify_runtime_robot_interface_configuration(
+                robot_interface_configuration
+            )
         prompt_artifact_metadata = {}
         if args.policy == "codex":
             policy = CodexAstraPolicy(
@@ -646,6 +664,9 @@ def run_eval(args):
                 work_root=policy_work_dir,
                 collision_mode=args.collision_mode,
                 motion_prompt_profile=args.motion_prompt_profile,
+                position_tolerance_m=args.position_tolerance_m,
+                orientation_tolerance_deg=args.orientation_tolerance_deg,
+                robot_interface_configuration=robot_interface_configuration,
             )
             prompt_artifact_metadata = policy.prompt_artifact_metadata()
             manifest["prompt_artifact_metadata"] = prompt_artifact_metadata
@@ -667,7 +688,6 @@ def run_eval(args):
         obs_config = utils.create_obs_config(
             CAMERAS, [IMAGE_SIZE, IMAGE_SIZE], method_name=""
         )
-        action_mode = MoveArmThenGripper2(EndEffectorPoseViaPlanning2(), Discrete())
         eval_env = AstraRLBenchEnv(
             task_classes=task_classes,
             observation_config=obs_config,

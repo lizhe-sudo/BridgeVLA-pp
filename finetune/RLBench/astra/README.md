@@ -40,9 +40,9 @@ The collision flag is `ignore_collisions`:
 
 | Mode | Policy output | Applied flag | Comparison boundary |
 | --- | --- | --- | --- |
-| `fixed0` | 8 values | always `0` | Default; collision checking stays enabled. This is not the baseline's predictive collision action space. |
-| `fixed1` | 8 values | always `1` | Planner is asked to ignore collisions. This is not the predictive action space. |
-| `predict` | 9 values, including the flag | policy value `0` or `1` | Predictive flag is part of the policy action space. |
+| `fixed0` | 8 values | always `0` | If the arm is already colliding, the planner may disable some colliding shapes and this action-mode path does not restore those flags. A failed path search can also retry once with checks disabled. It does not guarantee collision checks throughout the action. |
+| `fixed1` | 8 values | always `1` | The planner is asked to ignore collisions on its initial path search. This is not the predictive action space. |
+| `predict` | 9 values, including the flag | policy value `0` or `1` | Zero uses the same collision-sensitive behavior as `fixed0`; one starts with checks ignored. |
 
 No mode changes automatically based on task, planner result, or model output.
 Formal runs must state `--collision-mode` explicitly.
@@ -183,13 +183,16 @@ the prompt; the app rejects a reported tool event, but post-hoc event checking
 is not a hardened security boundary.
 
 The default `adaptive_small_steps` prompt remains available for existing
-evaluations. `--motion-prompt-profile general_closed_loop_v1` selects the
-task-agnostic initial and follow-up control messages. Its fixed rules do not
-contain task-specific manipulation steps; the task instruction and measured
-state are supplied by each observation. Run and session artifacts record the
-profile, initial/follow-up template SHA-256 values, the application-provided
-developer instructions, and each actual prompt plus its SHA-256. This profile
-does not change the observation, action, session, planner, or recording
+evaluations. `general_closed_loop_v1` is retained as a legacy profile; its
+original text is preserved for traceability. The recommended
+`--motion-prompt-profile interface_grounded_v1` profile supplies a concise,
+versioned Panda/RLBench interface note followed by task-independent control
+principles. Collision wording and arrival tolerances are rendered from the
+selected mode and parsed evaluator arguments. Run, session, and turn artifacts
+record the rendered notes and SHA-256, template versions and hashes, runtime
+robot/dependency configuration, actual application developer instructions,
+thresholds, and each actual prompt plus its SHA-256. The new profile does not
+change the observation, action, native session, planner, or recording
 interfaces.
 
 ## Failure classes, denominators, and timing
@@ -221,8 +224,10 @@ wall-clock time. The underlying model request count and unavailable token
 fields remain null. Simulation time counts
 successful `scene.step()` calls during action execution; video playback time
 and video duration are separate. Episode wall-clock ends before video
-encoding. Position and pose arrival checks are diagnostics only and never
-replace RLBench task success.
+encoding. Position arrival compares the post-action pose with the effective
+workspace-clipped target using the configured tolerance; pose arrival also
+checks orientation. Both are diagnostics only and never replace RLBench task
+success. A stopped arm is not proof that the target was reached.
 
 ## Dependencies and output layout
 

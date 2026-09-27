@@ -226,11 +226,31 @@ class RunEvalIntegrationTests(unittest.TestCase):
             policy_calls = []
 
             modules = {}
+            robot_interface_module = types.ModuleType("astra.robot_interface")
+            verified_runtime = {
+                "robot_setup": "panda",
+                "robot_interface_verification": "verified",
+                "robot_interface_notes_version": "panda_rlbench_interface_v1",
+            }
+            build_runtime = mock.Mock(return_value=verified_runtime)
+            verify_runtime = mock.Mock(side_effect=lambda config: config)
+            robot_interface_module.build_runtime_robot_interface_configuration = build_runtime
+            robot_interface_module.verify_runtime_robot_interface_configuration = verify_runtime
+            modules["astra.robot_interface"] = robot_interface_module
             pyrep = types.ModuleType("pyrep")
             pyrep.__file__ = "/fake/simulator/pyrep/__init__.py"
             modules["pyrep"] = pyrep
             rlbench = self.package(modules, "rlbench")
             rlbench.__file__ = "/fake/simulator/rlbench/__init__.py"
+            rlbench_environment = types.ModuleType("rlbench.environment")
+
+            class FakeRLBenchEnvironment:
+                def __init__(self, robot_setup="panda"):
+                    pass
+
+            rlbench_environment.Environment = FakeRLBenchEnvironment
+            modules["rlbench.environment"] = rlbench_environment
+            rlbench.environment = rlbench_environment
             action_modes = self.package(modules, "rlbench.action_modes")
             gripper_modes = types.ModuleType(
                 "rlbench.action_modes.gripper_action_modes"
@@ -332,6 +352,11 @@ class RunEvalIntegrationTests(unittest.TestCase):
             class FakeActionMode:
                 def __init__(self, *args):
                     self.args = args
+                    if len(args) == 2:
+                        self.arm_action_mode, self.gripper_action_mode = args
+                    else:
+                        self._absolute_mode = True
+                        self._frame = "world"
 
             planning = types.ModuleType("utils.rlbench_planning")
             planning.EndEffectorPoseViaPlanning2 = FakeActionMode
@@ -404,6 +429,7 @@ class RunEvalIntegrationTests(unittest.TestCase):
                 codex_cli_version_probe_invocation_count = 0
 
                 def __init__(self, **kwargs):
+                    self.kwargs = dict(kwargs)
                     self.last_metadata = None
                     self.motion_prompt_profile = kwargs.get(
                         "motion_prompt_profile", "adaptive_small_steps"
@@ -418,13 +444,31 @@ class RunEvalIntegrationTests(unittest.TestCase):
                     self.__class__.instances.append(self)
 
                 def prompt_artifact_metadata(self):
-                    return {
+                    metadata = {
                         "motion_prompt_profile": self.motion_prompt_profile,
                         "prompt_template_version": self.motion_prompt_profile,
                         "prompt_template_sha256": {},
                         "application_developer_instructions": "fake instructions",
                         "application_developer_instructions_sha256": "fake-sha256",
                     }
+                    if self.motion_prompt_profile == "interface_grounded_v1":
+                        metadata.update({
+                            "robot_interface_notes_version": "fake-interface-v1",
+                            "robot_interface_notes": "verified fake notes",
+                            "robot_interface_notes_sha256": "fake-notes-sha",
+                            "robot_interface_configuration": self.kwargs.get(
+                                "robot_interface_configuration"
+                            ),
+                            "robot_interface_diagnostic_thresholds": {
+                                "position_tolerance_m": self.kwargs.get(
+                                    "position_tolerance_m"
+                                ),
+                                "orientation_tolerance_deg": self.kwargs.get(
+                                    "orientation_tolerance_deg"
+                                ),
+                            },
+                        })
+                    return metadata
 
                 @staticmethod
                 def _schema_for_mode(_mode):
@@ -613,6 +657,51 @@ class RunEvalIntegrationTests(unittest.TestCase):
                 feedback1["eef_pose_after"][:3],
             )
             self.assertNotIn("reward", feedback1)
+
+            interface_output_root = root / "interface profile outputs"
+            with mock.patch.dict(sys.modules, modules), \
+                 mock.patch.object(eval_astra, "_add_project_paths", return_value={
+                     "rlbench_sim_stack": None, "pyrep_sim_stack": None,
+                     "coppeliasim_root": None, "coppeliasim_root_exists": False,
+                 }), \
+                 mock.patch.object(eval_astra, "_git_value", return_value=""), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                interface_args = eval_astra._build_parser().parse_args([
+                    "--tasks", "open_drawer", "--policy", "codex",
+                    "--run-mode", "debug", "--budget-protocol", "uniform25",
+                    "--eval-episodes", "1", "--repeats", "1",
+                    "--start-episode", "0", "--max-waypoints", "1",
+                    "--collision-mode", "fixed0", "--no-record-video",
+                    "--position-tolerance-m", "0.023",
+                    "--orientation-tolerance-deg", "9",
+                    "--motion-prompt-profile", "interface_grounded_v1",
+                    "--output-root", str(interface_output_root),
+                ])
+                interface_results = eval_astra.run_eval(interface_args)
+            self.assertEqual(len(interface_results), 1)
+            build_runtime.assert_called_once()
+            verify_runtime.assert_called_once_with(verified_runtime)
+            interface_policy = FakeCodexPolicy.instances[-1]
+            self.assertEqual(interface_policy.motion_prompt_profile,
+                             "interface_grounded_v1")
+            self.assertEqual(interface_policy.kwargs["position_tolerance_m"], 0.023)
+            self.assertEqual(interface_policy.kwargs["orientation_tolerance_deg"], 9.0)
+            self.assertEqual(
+                interface_policy.kwargs["robot_interface_configuration"],
+                verified_runtime,
+            )
+            interface_run_dir = next(interface_output_root.glob("astra_*"))
+            interface_manifest = json.loads(
+                (interface_run_dir / "run_manifest.json").read_text()
+            )
+            interface_metadata = interface_manifest["prompt_artifact_metadata"]
+            self.assertEqual(interface_metadata["robot_interface_notes"],
+                             "verified fake notes")
+            self.assertEqual(
+                interface_metadata["robot_interface_diagnostic_thresholds"],
+                {"position_tolerance_m": 0.023,
+                 "orientation_tolerance_deg": 9.0},
+            )
 
 
 class OutputLayoutTests(unittest.TestCase):

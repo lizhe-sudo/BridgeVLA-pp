@@ -1165,6 +1165,130 @@ class FakeAppServerTests(unittest.TestCase):
         finally:
             policy.close()
 
+    def test_interface_grounded_profile_runs_three_feedback_turns_on_one_thread(self):
+        from astra.codex_policy import CodexAstraPolicy
+
+        which_patch = mock.patch(
+            "astra.codex_policy.shutil.which", return_value=str(self.executable)
+        )
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
+        policy = CodexAstraPolicy(
+            model="gpt-6-luna", reasoning_effort="max", timeout=2,
+            work_root=str(self.root / "interface grounded policy work"),
+            collision_mode="fixed0",
+            motion_prompt_profile="interface_grounded_v1",
+            position_tolerance_m=0.01,
+            orientation_tolerance_deg=5.0,
+            robot_interface_configuration={
+                "robot_setup": "panda",
+                "rlbench": {"version": "1.2.0", "git_sha": "runtime"},
+                "pyrep": {"version": "4.1.0.3", "git_sha": "runtime"},
+            },
+        )
+        policy.set_evaluation_context("eval-interface", 1, "custom_task", 0, 25)
+        instruction = "Complete the instruction from current evidence."
+        policy.reset(instruction)
+        episode_dir = policy._episode_dir
+        before = [0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0]
+        environment_action_attempts = 0
+        try:
+            for step in range(3):
+                images = {
+                    name: np.full((8, 8, 3), step + 10, dtype=np.uint8)
+                    for name in CodexAstraPolicy.IMAGE_FIELDS
+                }
+                observation = AstraObservation(
+                    instruction, images, before, step == 0,
+                )
+                action = policy.act(observation)
+                metadata = dict(policy.last_metadata)
+                adapter = AstraActionAdapter("fixed0")
+                submitted = adapter.adapt(action)
+                self.assertEqual(submitted[:3], list(action.position))
+                self.assertEqual(submitted[3:7], [0.0, 0.0, 0.0, 1.0])
+                self.assertEqual(submitted[7:], [1.0, 0.0])
+                environment_action_attempts += 1
+                after = [before[0] + 0.003, before[1], before[2], 0, 0, 0, 1]
+                execution = {
+                    **adapter.last_diagnostics,
+                    "step_id": step,
+                    "eef_pose_before": before,
+                    "actual_eef_pose": after,
+                    "effective_planner_target": list(action.position),
+                    "effective_target_source": "existing planner target fixture",
+                    "gripper_before": step == 0,
+                    "gripper_after": step == 0,
+                    "environment_step_returned": True,
+                    "planner_returned": True,
+                    "position_reached": False,
+                    "pose_reached": False,
+                }
+                feedback = build_execution_feedback(
+                    execution, metadata["action_id"], metadata["observation_id"],
+                    policy.observation_id_for_step(step + 1),
+                )
+                policy.record_execution_feedback(feedback)
+                before = after
+
+            inputs = [row for row in self.protocol()
+                      if row.get("method") == "turn/start"]
+            starts = [row for row in self.protocol()
+                      if row.get("method") == "thread/start"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(len(inputs), 3)
+            self.assertEqual(environment_action_attempts, len(inputs))
+            self.assertEqual(len({row["params"]["threadId"] for row in inputs}), 1)
+            self.assertEqual(policy._session.turn_count, 3)
+
+            prompts = [row["params"]["input"][0]["text"] for row in inputs]
+            self.assertIn(policy._robot_interface_notes, prompts[0])
+            self.assertIn("ROBOT INTERFACE", prompts[0])
+            self.assertNotIn("MEASURED FEEDBACK FOR PREVIOUS ACTION", prompts[0])
+            for step, prompt in enumerate(prompts[1:], start=1):
+                self.assertNotIn("ROBOT INTERFACE", prompt)
+                self.assertIn("MEASURED FEEDBACK FOR PREVIOUS ACTION", prompt)
+                self.assertIn(f"action{step - 1:03d}", prompt)
+                self.assertIn(
+                    f"eval-interface:r1:custom_task:ep0:obs{step:03d}", prompt
+                )
+                self.assertIn(
+                    f"Measured EEF position: [{0.003 * step}, 0.0, 0.2]",
+                    prompt,
+                )
+                self.assertIn("actual_displacement_m", prompt)
+                self.assertNotIn("reward", prompt)
+                self.assertNotIn("object_pose", prompt)
+            self.assertEqual(
+                [item["type"] for item in inputs[0]["params"]["input"][1:]],
+                ["localImage"] * 4,
+            )
+            for request in inputs:
+                image_items = request["params"]["input"][1:]
+                self.assertEqual(
+                    [Path(item["path"]).name for item in image_items],
+                    ["front.png", "left_shoulder.png", "right_shoulder.png",
+                     "wrist.png"],
+                )
+            first_schema = inputs[0]["params"]["outputSchema"]
+            self.assertEqual(first_schema, inputs[1]["params"]["outputSchema"])
+            self.assertEqual(first_schema["required"],
+                             ["position", "quaternion", "gripper"])
+            self.assertFalse(first_schema["additionalProperties"])
+
+            session_manifest = json.loads(
+                (episode_dir / "session_manifest.json").read_text()
+            )
+            self.assertEqual(session_manifest["robot_interface_notes"],
+                             policy._robot_interface_notes)
+            self.assertEqual(session_manifest["motion_prompt_profile"],
+                             "interface_grounded_v1")
+            session = policy._session
+            policy.end_episode("three_turn_test_complete")
+            self.assertTrue(session.process_group_exit_confirmed)
+        finally:
+            policy.close()
+
     def test_binding_a_failed_new_request_cannot_reuse_previous_turn_id(self):
         from astra.codex_policy import CodexAstraPolicy
 

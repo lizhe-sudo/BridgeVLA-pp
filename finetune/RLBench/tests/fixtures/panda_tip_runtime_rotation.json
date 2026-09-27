@@ -1,0 +1,20 @@
+{
+  "source_audit": "interface_audit_20260927T044000Z",
+  "scope": "read-only startup pose from the dedicated Panda RLBench scene; test fixture only, not a control target",
+  "tip_quaternion_xyzw": [
+    3.988759544881759e-07,
+    0.9925469756126404,
+    1.102745983416753e-07,
+    0.12186255306005478
+  ],
+  "rotation_matrix_local_to_world": [
+    [-0.9702990055084229, 7.649295525880007e-07, 0.24190860986709595],
+    [8.186829631995352e-07, 1.0, 1.216893537048236e-07],
+    [-0.24190860986709595, 3.1612154316462693e-07, -0.9702990055084229]
+  ],
+  "open_finger_centroid_delta_in_tip_frame_m": [
+    -9.204960217238483e-05,
+    0.10105103635157003,
+    -6.301867904515677e-05
+  ]
+}
