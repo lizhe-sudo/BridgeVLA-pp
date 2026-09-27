@@ -94,6 +94,11 @@ def _build_parser():
         help="output root (default: <repository-root>/outputs, independent of cwd)",
     )
     parser.add_argument(
+        "--defer-output-finalization", action="store_true",
+        help=("leave the unique astra_<evaluation-id> directory for an external "
+              "supervisor to finalize after its post-exit log writes"),
+    )
+    parser.add_argument(
         "--record-video", action=argparse.BooleanOptionalAction, default=True,
         help="record separate four-view high-resolution video (default: true)",
     )
@@ -343,6 +348,9 @@ def run_eval(args):
         + "_" + uuid.uuid4().hex[:8]
     )
     from astra.output_paths import resolve_output_layout
+    from astra.output_naming import (
+        finalize_persisted_run,
+    )
 
     layout = resolve_output_layout(
         REPO_ROOT,
@@ -498,6 +506,10 @@ def run_eval(args):
             "policy_work_directory": policy_work_dir,
             "episode_artifacts_directory": output_dir,
             "recording_enabled": args.record_video,
+            "directory_finalization": (
+                "deferred_to_external_supervisor"
+                if args.defer_output_finalization else "evaluator_after_close"
+            ),
         },
         "arguments": vars(args),
         "episode_results": [],
@@ -1369,6 +1381,66 @@ def run_eval(args):
                 pass
         if not log_file.closed:
             log_file.close()
+        # The evaluator owns all core writes through this point.  The run root
+        # is renamed only after recorders and the run JSONL have been closed.
+        # If an interrupted process could not persist a trustworthy summary,
+        # preserve the unique astra_<evaluation_id> directory for diagnosis.
+        try:
+            run_summary_path = os.path.join(run_dir, "run_summary.json")
+            if os.path.isfile(run_summary_path):
+                with open(run_summary_path, "r", encoding="utf-8") as stream:
+                    persisted_summary = json.load(stream)
+                if (persisted_summary.get("evaluation_id") == evaluation_id and
+                        persisted_summary.get("completion_status") in
+                        ("complete", "incomplete")):
+                    if args.defer_output_finalization:
+                        print(json.dumps({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "kind": "run_directory_finalization_deferred",
+                            "evaluation_id": evaluation_id,
+                            "temporary_run_directory": run_dir,
+                            "completion_status": persisted_summary.get(
+                                "completion_status"
+                            ),
+                        }, ensure_ascii=False, allow_nan=False), flush=True)
+                    else:
+                        final_run_dir = finalize_persisted_run(
+                            layout.output_root, evaluation_id
+                        )
+                        final_manifest = json.loads(
+                            (final_run_dir / "run_manifest.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        for result in results:
+                            episode_output = result.get("output_directory")
+                            if isinstance(episode_output, str) and episode_output.startswith(
+                                    run_dir + os.sep):
+                                result["output_directory"] = str(final_run_dir) + episode_output[
+                                    len(run_dir):
+                                ]
+                        print(json.dumps({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "kind": "run_directory_finalized",
+                            "evaluation_id": evaluation_id,
+                            "friendly_run_name": final_manifest.get(
+                                "friendly_run_name"
+                            ),
+                            "final_run_directory": str(final_run_dir),
+                            "completion_status": persisted_summary.get(
+                                "completion_status"
+                            ),
+                            "result": final_manifest.get("run_result"),
+                        }, ensure_ascii=False, allow_nan=False), flush=True)
+        except Exception as finalize_error:
+            print(
+                "[eval_astra] run-directory finalization failed; the original "
+                "run artifacts were retained where possible: {}: {}".format(
+                    type(finalize_error).__name__, finalize_error
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def main(argv=None):

@@ -569,6 +569,7 @@ class RunEvalIntegrationTests(unittest.TestCase):
                     "--start-episode", "0", "--max-waypoints", "3",
                     "--collision-mode", "fixed0", "--no-record-video",
                     "--motion-prompt-profile", "general_closed_loop_v1",
+                    "--defer-output-finalization",
                     "--output-root", str(codex_output_root),
                 ])
                 codex_results = eval_astra.run_eval(codex_args)
@@ -581,7 +582,7 @@ class RunEvalIntegrationTests(unittest.TestCase):
             self.assertEqual(first_execution_order, expected_prefix, repr(results))
             self.assertEqual(len(policy_calls), 5)
             self.assertEqual(len(results), 5)
-            run_dir = next(output_root.glob("astra_*"))
+            run_dir = next(path for path in output_root.iterdir() if path.is_dir())
             manifest = json.loads((run_dir / "run_manifest.json").read_text())
             summary = json.loads((run_dir / "run_summary.json").read_text())
             self.assertFalse(manifest["output"]["artifact_layout"]["standard_layout"])
@@ -630,9 +631,14 @@ class RunEvalIntegrationTests(unittest.TestCase):
             fake_policy = FakeCodexPolicy.instances[-1]
             self.assertEqual(fake_policy.motion_prompt_profile,
                              "general_closed_loop_v1")
-            codex_run_dir = next(codex_output_root.glob("astra_*"))
+            codex_run_dir = next(path for path in codex_output_root.iterdir() if path.is_dir())
             codex_manifest = json.loads(
                 (codex_run_dir / "run_manifest.json").read_text()
+            )
+            self.assertTrue(codex_run_dir.name.startswith("astra_"))
+            self.assertEqual(
+                codex_manifest["output"]["directory_finalization"],
+                "deferred_to_external_supervisor",
             )
             self.assertEqual(
                 codex_manifest["prompt_artifact_metadata"]["motion_prompt_profile"],
@@ -657,6 +663,18 @@ class RunEvalIntegrationTests(unittest.TestCase):
                 feedback1["eef_pose_after"][:3],
             )
             self.assertNotIn("reward", feedback1)
+
+            from astra.output_naming import finalize_persisted_run
+            finalized_codex_run = finalize_persisted_run(
+                codex_output_root, codex_manifest["evaluation_id"]
+            )
+            self.assertFalse(codex_run_dir.exists())
+            self.assertEqual(
+                json.loads((finalized_codex_run / "run_manifest.json").read_text())[
+                    "final_run_directory"
+                ],
+                str(finalized_codex_run),
+            )
 
             interface_output_root = root / "interface profile outputs"
             with mock.patch.dict(sys.modules, modules), \
@@ -690,7 +708,9 @@ class RunEvalIntegrationTests(unittest.TestCase):
                 interface_policy.kwargs["robot_interface_configuration"],
                 verified_runtime,
             )
-            interface_run_dir = next(interface_output_root.glob("astra_*"))
+            interface_run_dir = next(
+                path for path in interface_output_root.iterdir() if path.is_dir()
+            )
             interface_manifest = json.loads(
                 (interface_run_dir / "run_manifest.json").read_text()
             )

@@ -246,21 +246,73 @@ nonstandard; formal mode disallows that option. If `rlbench` or `pyrep` has
 already been imported from the wrong location, the evaluator asks for a fresh
 process instead of changing paths and continuing.
 
-Each run defaults to `<repository-root>/outputs/astra_<evaluation-id>`,
-regardless of the launch directory. `--output-root` explicitly changes the
-root; `--codex-work-root` and `--log-file` explicitly override their paths.
-Any override that moves artifacts outside the default unified layout prints a
-startup warning and is listed in the manifest. A stable, empty control working
-directory outside the repository is used for the full episode and removed
-when the episode closes, if empty. Codex's native conversation store remains
-managed by Codex under the current user's configured storage; Astra records a
-safe location and IDs but does not copy native session files into `outputs`.
-Application evidence and episode artifacts remain under the current run.
+Each run starts in a unique temporary directory named
+`outputs/astra_<evaluation-id>`, regardless of the launch directory. After the
+run summary is durable, episode recorders and the run log are closed, and video
+finalization has finished, the evaluator renames a reliable complete or
+incomplete run to a readable final name:
+
+```text
+{task}_{model-short}_{reasoning}_{result}/
+```
+
+Examples are `open_drawer_astra_high_success` and
+`place_cups_luna_max_failed`. Known models map explicitly (`gpt-6-luna` to
+`luna`, `gpt-6-astra` to `astra`); other names are lowercased and sanitized to
+letters, digits, and single underscores. Reasoning effort is the requested
+effort, sanitized the same way.
+
+For a complete single-episode task, a successful episode is `success` and an
+evaluable unsuccessful episode is `failed`. Infrastructure errors, unknown
+results, and runs that cannot be completed are `incomplete`. For one task with
+multiple episodes, all-success is `success`, all-failure is `failed`, and a
+mixture is `mixed`. Multi-task runs use the `multi_task_` prefix and the same
+summary-result rules. A run without a reliable persisted summary remains at
+`astra_<evaluation-id>` for diagnosis.
+
+Friendly names do not replace the unique `evaluation_id`; manifests and episode
+artifacts retain it. `run_manifest.json` and `run_summary.json` also record
+`friendly_run_name`, `final_run_directory`, and `output_directory`. If a
+friendly name is already in use, the evaluator appends the stable ID, for
+example `place_cups_astra_high_failed__<evaluation-id>`. It never overwrites
+or merges an existing run. If that qualified path also exists, finalization
+leaves the unique temporary directory in place and reports the collision.
+
+External supervisors should identify runs by `evaluation_id`, not by retaining
+the temporary path. The evaluator prints a `run_directory_finalized` JSON
+event with the final path before it exits. If a supervisor writes
+`supervision.jsonl` or copies stdout **after** the evaluator exits, pass
+`--defer-output-finalization` to the evaluator. The evaluator leaves the
+`astra_<evaluation-id>` root in place; after all owned processes have exited
+and the supervisor has finished its writes, finalize it with:
+
+```bash
+python finetune/RLBench/finalize_astra_run.py --evaluation-id <evaluation-id>
+```
+
+This command uses the same naming and no-replace rename helper, updates
+structured artifact paths and indexed hashes, then prints the final directory.
+The supervisor should resolve paths again by `evaluation_id` after
+finalization, using `astra.output_naming.resolve_run_directory(output_root,
+evaluation_id)`, instead of writing through a cached temporary path. Existing
+structured supervision path fields are relocated. Plain-text stdout history
+is retained as written.
+
+`--output-root` explicitly changes the root; `--codex-work-root` and
+`--log-file` explicitly override their paths. Any override that moves artifacts
+outside the default unified layout prints a startup warning and is listed in
+the manifest. A stable, empty control working directory outside the repository
+is used for the full episode and removed when the episode closes, if empty.
+Codex's native conversation store remains managed by Codex under the current
+user's configured storage; Astra records a safe location and IDs but does not
+copy native session files into `outputs`. Application evidence and episode
+artifacts remain under the current run.
 
 Each run creates:
 
 ```text
-outputs/astra_<evaluation-id>/
+outputs/astra_<evaluation-id>/              # while running / no reliable summary
+outputs/{task}_{model}_{reasoning}_{result}/ # after safe finalization
   run_manifest.json       # resolved protocol, code/dependency/model identity
   run_summary.json        # episode/task/repeat aggregates
   run.jsonl               # step and summary events
@@ -346,8 +398,10 @@ bash eval_astra.sh \
 ```
 
 `--max-waypoints 25` is a debug cap on this task's 25-target `uniform25`
-budget. The output path is `outputs/astra_<evaluation-id>/` under the
-repository. A run contains app-level policy evidence in `policy_work/`,
+budget. The run is first written under `outputs/astra_<evaluation-id>/`, then
+finalized to its task/model/reasoning/result directory after normal completion.
+The unique `evaluation_id` remains in the run artifacts. A run contains
+app-level policy evidence in `policy_work/`,
 per-step execution records under `episodes/<episode-run>/steps/`, and the
 four-view MP4 and frame timeline under that episode's `video/` directory.
 
