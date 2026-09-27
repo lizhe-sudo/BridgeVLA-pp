@@ -115,9 +115,38 @@ class InterfaceGroundedProfileTests(unittest.TestCase):
         self.assertIn("less than 7.25 degrees", prompt)
         self.assertIn("0.01 m or less", prompt)
         self.assertIn("TASK INSTRUCTION: Complete the supplied task.", prompt)
+        self.assertIn(
+            "Measured gripper_open: true\n"
+            "Interpretation: near fully open. This flag alone does not "
+            "establish exact aperture or object contact.",
+            prompt,
+        )
         self.assertIn("1. front\n2. left_shoulder\n3. right_shoulder\n4. wrist", prompt)
         self.assertNotIn("{{", prompt)
         self.assertNotIn("}}", prompt)
+
+    def test_first_prompt_distinguishes_true_false_and_unknown_measurements(self):
+        cases = (
+            (True, "Measured gripper_open: true\n"
+                   "Interpretation: near fully open. This flag alone does not "
+                   "establish exact aperture or object contact."),
+            (False, "Measured gripper_open: false\n"
+                    "Interpretation: not near fully open. This flag does not "
+                    "establish complete closure, exact aperture, or whether "
+                    "an object is held."),
+            (None, "Measured gripper_open: unknown\n"
+                   "Interpretation: unavailable; do not infer aperture, "
+                   "closure, or object contact."),
+        )
+        for measured, expected in cases:
+            with self.subTest(measured=measured):
+                prompt = self.prompt("Perform the supplied task.",
+                                     gripper_open=measured)
+                state = prompt[prompt.rfind("Measured gripper_open:"):]
+                state = state.split("\n\n", 1)[0]
+                self.assertEqual(state, expected)
+                self.assertNotIn("Measured gripper state: Measured gripper_open:",
+                                 prompt)
 
     def test_task_changes_do_not_change_fixed_interface_or_principles(self):
         prompts = [self.prompt(task) for task in (
@@ -138,20 +167,42 @@ class InterfaceGroundedProfileTests(unittest.TestCase):
             "eef_pose_after": [0.101, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
             "requested_displacement_m": [0.01, 0.0, 0.0],
             "actual_displacement_m": [0.001, 0.0, 0.0],
+            "gripper_command": 0,
+            "gripper_open_before": True,
+            "gripper_open_after": None,
             "position_reached": False,
             "pose_reached": False,
         }
-        self.policy._pending_feedback = measured_feedback
         pose = [0.101, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
-        prompt = self.prompt("continue from current evidence", step=1,
-                             pose=pose, gripper_open=False)
-        self.assertTrue(prompt.startswith("Continue the same task episode."))
-        self.assertIn(json.dumps(measured_feedback), prompt)
-        self.assertIn("interface-test:r1:custom:ep0:obs001", prompt)
-        self.assertIn("Measured gripper state: closed", prompt)
-        self.assertNotIn("ROBOT INTERFACE", prompt)
-        self.assertNotIn("ROBOT INTERFACE NOTES", prompt)
-        self.assertEqual(prompt.count("TASK INSTRUCTION:"), 1)
+        for current_measurement, expected in (
+            (True, "Measured gripper_open: true\n"
+                   "Interpretation: near fully open. This flag alone does not "
+                   "establish exact aperture or object contact."),
+            (False, "Measured gripper_open: false\n"
+                    "Interpretation: not near fully open. This flag does not "
+                    "establish complete closure, exact aperture, or whether "
+                    "an object is held."),
+        ):
+            with self.subTest(current_measurement=current_measurement):
+                self.policy._pending_feedback = measured_feedback
+                prompt = self.prompt(
+                    "continue from current evidence", step=1, pose=pose,
+                    gripper_open=current_measurement,
+                )
+                self.assertTrue(prompt.startswith(
+                    "Continue the same task episode."
+                ))
+                self.assertIn(json.dumps(measured_feedback), prompt)
+                self.assertIn('"gripper_command": 0', prompt)
+                self.assertIn('"gripper_open_before": true', prompt)
+                self.assertIn('"gripper_open_after": null', prompt)
+                state = prompt[prompt.rfind("Measured gripper_open:"):]
+                state = state.split("\n\n", 1)[0]
+                self.assertEqual(state, expected)
+                self.assertIn("interface-test:r1:custom:ep0:obs001", prompt)
+                self.assertNotIn("ROBOT INTERFACE", prompt)
+                self.assertNotIn("ROBOT INTERFACE NOTES", prompt)
+                self.assertEqual(prompt.count("TASK INSTRUCTION:"), 1)
 
     def test_notes_are_confirmed_task_independent_and_path_free(self):
         notes = self.policy._robot_interface_notes
@@ -310,13 +361,19 @@ class InterfaceGroundedProfileTests(unittest.TestCase):
 
     def test_adapter_keeps_accepted_targets_and_action_space_unchanged(self):
         target = [2.5, -4.0, 7.25]
-        action = AstraAction(target, [0.0, 0.0, 0.0, 2.0], 0)
         adapter = AstraActionAdapter("fixed0")
-        final_action = adapter.adapt(action)
-        self.assertEqual(final_action[:3], target)
-        self.assertEqual(final_action[3:7], [0.0, 0.0, 0.0, 1.0])
-        self.assertEqual(final_action[7:], [0.0, 0.0])
-        self.assertNotIn("workspace_clip", adapter.last_diagnostics)
+        for command in (0, 1):
+            with self.subTest(command=command):
+                action = AstraAction(target, [0.0, 0.0, 0.0, 2.0], command)
+                final_action = adapter.adapt(action)
+                self.assertEqual(final_action[:3], target)
+                self.assertEqual(final_action[3:7], [0.0, 0.0, 0.0, 1.0])
+                self.assertEqual(final_action[7:], [float(command), 0.0])
+                self.assertEqual(
+                    adapter.last_diagnostics["validated_action"]["gripper"],
+                    command,
+                )
+                self.assertNotIn("workspace_clip", adapter.last_diagnostics)
 
     def test_four_camera_policy_input_and_recording_resolution_contract_unchanged(self):
         from eval_astra import _build_parser

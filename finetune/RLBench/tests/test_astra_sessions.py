@@ -1199,7 +1199,7 @@ class FakeAppServerTests(unittest.TestCase):
                     for name in CodexAstraPolicy.IMAGE_FIELDS
                 }
                 observation = AstraObservation(
-                    instruction, images, before, step == 0,
+                    instruction, images, before, step < 2,
                 )
                 action = policy.act(observation)
                 metadata = dict(policy.last_metadata)
@@ -1217,7 +1217,7 @@ class FakeAppServerTests(unittest.TestCase):
                     "actual_eef_pose": after,
                     "effective_planner_target": list(action.position),
                     "effective_target_source": "existing planner target fixture",
-                    "gripper_before": step == 0,
+                    "gripper_before": step < 2,
                     "gripper_after": step == 0,
                     "environment_step_returned": True,
                     "planner_returned": True,
@@ -1245,6 +1245,8 @@ class FakeAppServerTests(unittest.TestCase):
             self.assertIn(policy._robot_interface_notes, prompts[0])
             self.assertIn("ROBOT INTERFACE", prompts[0])
             self.assertNotIn("MEASURED FEEDBACK FOR PREVIOUS ACTION", prompts[0])
+            self.assertIn("Measured gripper_open: true\n"
+                          "Interpretation: near fully open", prompts[0])
             for step, prompt in enumerate(prompts[1:], start=1):
                 self.assertNotIn("ROBOT INTERFACE", prompt)
                 self.assertIn("MEASURED FEEDBACK FOR PREVIOUS ACTION", prompt)
@@ -1259,6 +1261,12 @@ class FakeAppServerTests(unittest.TestCase):
                 self.assertIn("actual_displacement_m", prompt)
                 self.assertNotIn("reward", prompt)
                 self.assertNotIn("object_pose", prompt)
+            self.assertIn("Measured gripper_open: true\n"
+                          "Interpretation: near fully open", prompts[1])
+            self.assertIn("Measured gripper_open: false\n"
+                          "Interpretation: not near fully open", prompts[2])
+            self.assertIn('"gripper_open_after": true', prompts[1])
+            self.assertIn('"gripper_open_after": false', prompts[2])
             self.assertEqual(
                 [item["type"] for item in inputs[0]["params"]["input"][1:]],
                 ["localImage"] * 4,

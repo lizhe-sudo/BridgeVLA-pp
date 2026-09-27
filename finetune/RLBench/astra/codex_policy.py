@@ -253,7 +253,7 @@ Remaining target-action budget: {remaining_budget}
 Current observation ID: {observation_id}
 Measured EEF position: {current_position}
 Measured EEF quaternion: {current_quaternion}
-Measured gripper state: {current_gripper_state}
+{current_gripper_state}
 
 The four attached images are the CURRENT observation, in this order:
 1. front
@@ -274,7 +274,7 @@ CURRENT OBSERVATION
 Observation ID: {observation_id}
 Measured EEF position: {current_position}
 Measured EEF quaternion: {current_quaternion}
-Measured gripper state: {current_gripper_state}
+{current_gripper_state}
 
 The four newly attached images are the CURRENT:
 front, left_shoulder, right_shoulder, wrist.
@@ -1106,7 +1106,9 @@ class CodexAstraPolicy(AstraPolicy):
                 "observation_id": observation_id,
                 "current_position": json.dumps(pose[:3]),
                 "current_quaternion": json.dumps(pose[3:7]),
-                "current_gripper_state": gripper_text,
+                "current_gripper_state": self._interface_gripper_measurement_text(
+                    observation.gripper_open
+                ),
             }
             if int(step_id) == 0:
                 template = INTERFACE_GROUNDED_V1_INITIAL_TEMPLATE
@@ -1230,6 +1232,26 @@ class CodexAstraPolicy(AstraPolicy):
             "Keep movements small while uncertain, and reduce the motion near contact "
             "or after an unexpected execution result.\n"
             "Output exactly one next absolute target in the required schema."
+        )
+
+    @staticmethod
+    def _interface_gripper_measurement_text(gripper_open):
+        if gripper_open is None:
+            return (
+                "Measured gripper_open: unknown\n"
+                "Interpretation: unavailable; do not infer aperture, closure, "
+                "or object contact."
+            )
+        if bool(gripper_open):
+            return (
+                "Measured gripper_open: true\n"
+                "Interpretation: near fully open. This flag alone does not "
+                "establish exact aperture or object contact."
+            )
+        return (
+            "Measured gripper_open: false\n"
+            "Interpretation: not near fully open. This flag does not establish "
+            "complete closure, exact aperture, or whether an object is held."
         )
 
     def _observation_id(self, step_id):
