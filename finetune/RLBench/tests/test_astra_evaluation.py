@@ -405,6 +405,9 @@ class RunEvalIntegrationTests(unittest.TestCase):
 
                 def __init__(self, **kwargs):
                     self.last_metadata = None
+                    self.motion_prompt_profile = kwargs.get(
+                        "motion_prompt_profile", "adaptive_small_steps"
+                    )
                     self.step = 0
                     self.feedback = None
                     self.seen_inputs = []
@@ -413,6 +416,15 @@ class RunEvalIntegrationTests(unittest.TestCase):
                     self.session_id = f"fake-session-{len(self.instances) + 1}"
                     self.turn_ids = []
                     self.__class__.instances.append(self)
+
+                def prompt_artifact_metadata(self):
+                    return {
+                        "motion_prompt_profile": self.motion_prompt_profile,
+                        "prompt_template_version": self.motion_prompt_profile,
+                        "prompt_template_sha256": {},
+                        "application_developer_instructions": "fake instructions",
+                        "application_developer_instructions_sha256": "fake-sha256",
+                    }
 
                 @staticmethod
                 def _schema_for_mode(_mode):
@@ -512,6 +524,7 @@ class RunEvalIntegrationTests(unittest.TestCase):
                     "--eval-episodes", "1", "--repeats", "1",
                     "--start-episode", "0", "--max-waypoints", "3",
                     "--collision-mode", "fixed0", "--no-record-video",
+                    "--motion-prompt-profile", "general_closed_loop_v1",
                     "--output-root", str(codex_output_root),
                 ])
                 codex_results = eval_astra.run_eval(codex_args)
@@ -571,6 +584,20 @@ class RunEvalIntegrationTests(unittest.TestCase):
             self.assertEqual(codex_results[0]["app_server_session_create_count"], 1)
             self.assertEqual(codex_results[0]["app_server_turn_count"], 3)
             fake_policy = FakeCodexPolicy.instances[-1]
+            self.assertEqual(fake_policy.motion_prompt_profile,
+                             "general_closed_loop_v1")
+            codex_run_dir = next(codex_output_root.glob("astra_*"))
+            codex_manifest = json.loads(
+                (codex_run_dir / "run_manifest.json").read_text()
+            )
+            self.assertEqual(
+                codex_manifest["prompt_artifact_metadata"]["motion_prompt_profile"],
+                "general_closed_loop_v1",
+            )
+            self.assertEqual(
+                codex_results[0]["motion_prompt_profile"],
+                "general_closed_loop_v1",
+            )
             self.assertEqual(len(fake_policy.seen_inputs), 3)
             self.assertIsNone(fake_policy.seen_inputs[0]["feedback"])
             self.assertEqual(

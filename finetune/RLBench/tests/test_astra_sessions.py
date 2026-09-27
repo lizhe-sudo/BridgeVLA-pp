@@ -1,5 +1,6 @@
 """Regression tests for episode-scoped Codex App Server control sessions."""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -908,6 +909,259 @@ class FakeAppServerTests(unittest.TestCase):
                                   if row.get("method") == "thread/start"]), 2)
             policy.end_episode("second_fake_episode_complete")
             self.assertIsNone(policy._control_work_dir)
+        finally:
+            policy.close()
+
+    def test_general_closed_loop_profile_is_selectable_and_task_agnostic(self):
+        from astra.codex_policy import CodexAstraPolicy
+        from eval_astra import _build_parser
+        from utils.peract_utils_rlbench import IMAGE_SIZE
+
+        args = _build_parser().parse_args([
+            "--policy", "codex", "--motion-prompt-profile",
+            "general_closed_loop_v1",
+        ])
+        self.assertEqual(args.motion_prompt_profile, "general_closed_loop_v1")
+        self.assertEqual(
+            _build_parser().parse_args([]).motion_prompt_profile,
+            "adaptive_small_steps",
+        )
+        self.assertEqual(IMAGE_SIZE, 128)
+        self.assertEqual(
+            (args.recording_width, args.recording_height, args.recording_fps),
+            (1280, 720, 20),
+        )
+
+        policy = CodexAstraPolicy(
+            model="gpt-6-luna", reasoning_effort="max", timeout=2,
+            work_root=str(self.root / "general prompts"),
+            collision_mode="fixed0",
+            motion_prompt_profile=args.motion_prompt_profile,
+        )
+        policy.set_evaluation_context("eval-general", 1, "custom", 0, 25)
+        pose = [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
+        images = {name: np.zeros((8, 8, 3), dtype=np.uint8)
+                  for name in CodexAstraPolicy.IMAGE_FIELDS}
+        prompts = [
+            policy._make_prompt(
+                AstraObservation(instruction, images, pose, True), pose, 0
+            )
+            for instruction in (
+                "open the drawer", "press the buttons", "stack the blocks",
+            )
+        ]
+        fixed_rules = [
+            prompt.split("\nCURRENT EPISODE\n", 1)[0] for prompt in prompts
+        ]
+        self.assertEqual(fixed_rules[0], fixed_rules[1])
+        self.assertEqual(fixed_rules[0], fixed_rules[2])
+        for forbidden in ("drawer", "handle", "cabinet"):
+            self.assertNotIn(forbidden, fixed_rules[0].lower())
+        self.assertIn("TASK INSTRUCTION: open the drawer", prompts[0])
+        self.assertIn("TASK INSTRUCTION: press the buttons", prompts[1])
+        self.assertIn("TASK INSTRUCTION: stack the blocks", prompts[2])
+        self.assertIn(
+            "Collision mode is fixed0. The evaluator supplies ignore_collisions = 0",
+            prompts[0],
+        )
+        self.assertNotIn("{task_instruction}", prompts[0])
+        self.assertNotIn("{collision_mode_instructions}", prompts[0])
+        self.assertNotIn("MEASURED FEEDBACK FOR PREVIOUS ACTION", prompts[0])
+
+        changed_state = policy._make_prompt(
+            AstraObservation("open the drawer", images,
+                             [0.11, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], False),
+            [0.11, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], 0,
+        )
+        self.assertEqual(
+            fixed_rules[0],
+            changed_state.split("\nCURRENT EPISODE\n", 1)[0],
+        )
+        self.assertIn("Measured EEF position, meters: [0.11, 0.2, 0.3]",
+                      changed_state)
+        self.assertIn("Measured gripper state: closed", changed_state)
+
+        provenance = policy.prompt_artifact_metadata()
+        self.assertEqual(provenance["motion_prompt_profile"],
+                         "general_closed_loop_v1")
+        self.assertEqual(provenance["prompt_template_version"],
+                         "general_closed_loop_v1")
+        self.assertEqual(set(provenance["prompt_template_sha256"]),
+                         {"first_turn", "followup_turn"})
+        self.assertTrue(all(len(value) == 64 for value in
+                            provenance["prompt_template_sha256"].values()))
+        self.assertNotIn("drawer", provenance[
+            "application_developer_instructions"].lower())
+        self.assertEqual(
+            provenance["application_developer_instructions_sha256"],
+            hashlib.sha256(provenance[
+                "application_developer_instructions"].encode("utf-8")).hexdigest(),
+        )
+
+        for mode, expected in (
+            ("fixed0", "ignore_collisions = 0"),
+            ("fixed1", "ignore_collisions = 1"),
+            ("predict", "Include ignore_collisions as an integer"),
+        ):
+            policy.collision_mode = mode
+            self.assertIn(
+                expected,
+                policy._collision_prompt(profile="general_closed_loop_v1"),
+            )
+
+    def test_general_profile_actual_turns_keep_one_thread_and_unclipped_action(self):
+        from astra.codex_policy import CodexAstraPolicy
+
+        which_patch = mock.patch(
+            "astra.codex_policy.shutil.which", return_value=str(self.executable)
+        )
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
+        policy = CodexAstraPolicy(
+            model="gpt-6-luna", reasoning_effort="max", timeout=2,
+            work_root=str(self.root / "general policy work"),
+            collision_mode="fixed0",
+            motion_prompt_profile="general_closed_loop_v1",
+        )
+        policy.set_evaluation_context("eval-general-turns", 1, "open_drawer", 0, 25)
+        instruction = "Use the environment instruction as supplied."
+        policy.reset(instruction)
+        episode_dir = policy._episode_dir
+        before = [0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0]
+        requested_actions = []
+        try:
+            for step in range(2):
+                images = {
+                    name: np.full((8, 8, 3), step, dtype=np.uint8)
+                    for name in CodexAstraPolicy.IMAGE_FIELDS
+                }
+                observation = AstraObservation(
+                    instruction, images, before, step == 0,
+                )
+                action = policy.act(observation)
+                metadata = dict(policy.last_metadata)
+                requested_actions.append(action)
+                adapter = AstraActionAdapter("fixed0")
+                adapted = adapter.adapt(action)
+                self.assertEqual(adapted[:3], list(action.position))
+                self.assertEqual(metadata["motion_prompt_profile"],
+                                 "general_closed_loop_v1")
+                self.assertEqual(metadata["prompt_template_version"],
+                                 "general_closed_loop_v1")
+                self.assertEqual(
+                    metadata["prompt_sha256"],
+                    hashlib.sha256(metadata["prompt"].encode("utf-8")).hexdigest(),
+                )
+                if step == 0:
+                    self.assertGreater(
+                        float(np.linalg.norm(
+                            np.asarray(action.position) - np.asarray(before[:3])
+                        )), 0.01,
+                    )
+                    after = [0.02, 0.003, 0.2, 0.0, 0.0, 0.0, 1.0]
+                    execution = {
+                        **adapter.last_diagnostics,
+                        "step_id": 0,
+                        "eef_pose_before": before,
+                        "actual_eef_pose": after,
+                        "effective_planner_target": adapter.last_diagnostics[
+                            "validated_action"]["position"],
+                        "effective_target_source": "existing_action_adapter",
+                        "gripper_before": True,
+                        "gripper_after": True,
+                        "environment_step_returned": True,
+                        "planner_returned": True,
+                    }
+                    feedback = build_execution_feedback(
+                        execution, metadata["action_id"],
+                        metadata["observation_id"],
+                        policy.observation_id_for_step(1),
+                    )
+                    policy.record_execution_feedback(feedback)
+                    before = after
+
+            inputs = [
+                row for row in self.protocol()
+                if row.get("method") == "turn/start"
+            ]
+            starts = [
+                row for row in self.protocol()
+                if row.get("method") == "thread/start"
+            ]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(len(inputs), 2)
+            self.assertEqual(len(requested_actions), 2)
+            self.assertEqual(len({
+                row["params"]["threadId"] for row in inputs
+            }), 1)
+            self.assertEqual(policy._session.turn_count, 2)
+            self.assertEqual(
+                requested_actions[0].position, [0.05, 0.01, 0.2]
+            )
+            first_prompt = inputs[0]["params"]["input"][0]["text"]
+            second_prompt = inputs[1]["params"]["input"][0]["text"]
+            self.assertIn("TASK INSTRUCTION: Use the environment instruction as supplied.",
+                          first_prompt)
+            self.assertNotIn("MEASURED FEEDBACK FOR PREVIOUS ACTION", first_prompt)
+            self.assertNotIn("CONTROL INTERFACE", second_prompt)
+            self.assertIn(json.dumps(feedback, ensure_ascii=False, allow_nan=False),
+                          second_prompt)
+            self.assertIn("Measured EEF position, meters: [0.02, 0.003, 0.2]",
+                          second_prompt)
+            self.assertIn("Remaining target-action budget: 24", second_prompt)
+            self.assertEqual(
+                [item["type"] for item in inputs[0]["params"]["input"][1:]],
+                ["localImage"] * 4,
+            )
+            self.assertEqual(
+                [item["path"].rsplit("/", 1)[-1]
+                 for item in inputs[1]["params"]["input"][1:]],
+                ["front.png", "left_shoulder.png", "right_shoulder.png",
+                 "wrist.png"],
+            )
+            self.assertEqual(inputs[0]["params"]["outputSchema"], inputs[1]["params"]["outputSchema"])
+            schema = inputs[0]["params"]["outputSchema"]
+            self.assertEqual(schema["required"], ["position", "quaternion", "gripper"])
+            self.assertFalse(schema["additionalProperties"])
+
+            control_rows = [
+                json.loads(line) for line in
+                (episode_dir / "control_messages.jsonl").read_text().splitlines()
+            ]
+            turn_inputs = [
+                row for row in control_rows if row.get("event") == "turn_input"
+            ]
+            feedback_rows = [
+                row for row in control_rows
+                if row.get("event") == "execution_feedback"
+            ]
+            self.assertEqual(len(turn_inputs), 2)
+            self.assertEqual(len(feedback_rows), 1)
+            self.assertEqual(feedback_rows[0]["step_id"], 0)
+            self.assertEqual(feedback_rows[0]["eef_pose_after"], after)
+            for row, request in zip(turn_inputs, inputs):
+                prompt_text = row["message_text"]
+                self.assertEqual(prompt_text, request["params"]["input"][0]["text"])
+                self.assertEqual(
+                    row["prompt_sha256"],
+                    hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+                )
+                self.assertEqual(row["motion_prompt_profile"],
+                                 "general_closed_loop_v1")
+                self.assertEqual(len(row["images"]), 4)
+            self.assertEqual(len(list(episode_dir.glob("step_*/accepted_action.json"))), 2)
+            policy.end_episode("fake_general_profile_validation")
+            session_manifest = json.loads(
+                (episode_dir / "session_manifest.json").read_text()
+            )
+            self.assertEqual(
+                session_manifest["application_developer_instructions"],
+                policy._developer_instructions,
+            )
+            self.assertEqual(
+                session_manifest["motion_prompt_profile"],
+                "general_closed_loop_v1",
+            )
         finally:
             policy.close()
 

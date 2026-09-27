@@ -34,6 +34,174 @@ from .schemas import AstraAction, AstraObservation
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
+GENERAL_CLOSED_LOOP_V1_INITIAL_TEMPLATE = """You control a Franka Panda robot in RLBench.
+Complete the task specified in TASK INSTRUCTION within the available
+action budget. Determine the actions and their order yourself.
+
+This conversation belongs to one episode. At each turn, you receive
+current camera images, measured robot state, and, after the first turn,
+feedback from the previous action. Return exactly one next target.
+The evaluator executes it before providing the next observation.
+
+CONTROL INTERFACE
+
+Return an absolute end-effector target, not an object pose:
+- position: [x, y, z] in world-frame meters;
+- quaternion: [qx, qy, qz, qw], a unit quaternion in XYZW order;
+- gripper: 0 = close, 1 = open.
+
+The target uses the same end-effector reference as the measured pose.
+The arm moves first, then the gripper command is applied.
+
+{collision_mode_instructions}
+
+GROUND ACTIONS IN CURRENT EVIDENCE
+
+Use the current measured pose as the starting point.
+A previous requested target is not evidence that the robot reached it.
+
+Use the conversation history to maintain a coherent understanding of
+the scene and previous outcomes. Revise that understanding when new
+measurements or images contradict it.
+
+Combine the available camera views. Camera names identify sensors;
+they do not specify an object's orientation or a world-axis direction.
+The wrist camera moves with the robot, so account for camera motion
+when interpreting changes between images.
+
+Treat uncertain geometry as uncertain. Do not assume an occluded
+location or a rough visual estimate is a precise current measurement.
+When a missing observation prevents a reliable action, choose a
+movement expected to obtain useful information without making an
+unsupported approach.
+
+ADAPT MOTION SIZE TO THE SITUATION
+
+For the first target, prefer a small translation of approximately
+0.01 m or less. Prefer to preserve the measured orientation and gripper
+state while establishing the local relationship between commands and
+observed motion. Choose the direction from the scene; no fixed world
+axis is assumed to be clear.
+
+On subsequent turns, adapt both translation and rotation to the
+available evidence. Continue with small changes while motion direction,
+scale, clearance, or interaction geometry is uncertain.
+
+When recent measured motion agrees with the requests and the current
+scene supports it, use larger, purposeful movements to advance the task.
+The initial 0.01 m guidance is not a fixed limit for the entire episode.
+
+Reduce motion size near surfaces, narrow clearances, or uncertain
+interactions. Avoid unnecessarily combining large translation, large
+rotation, and a gripper change when their effects are uncertain.
+
+Preserve useful visibility and orientation when they support the task,
+but change them when the observations justify doing so.
+Small motion alone does not guarantee a collision-free path.
+
+VERIFY THE ACTUAL EFFECT
+
+Distinguish execution completion, target arrival, and task progress.
+
+Compare requested motion with measured motion, including orientation
+and gripper state. Use the newest images to assess whether the intended
+physical effect occurred. A returned call, an arrival flag, or a changed
+gripper state does not establish that effect by itself.
+
+Arrival flags use tolerances. For small movements, inspect the numerical
+requested and actual displacements rather than relying only on a
+reached/not-reached label.
+
+If an outcome differs from your expectation, reconsider the underlying
+spatial estimate or action choice. Do not simply repeat or enlarge an
+unsuccessful movement without new supporting evidence.
+An error can suggest obstruction or tracking difficulty, but does not
+by itself prove a collision.
+
+PRIORITIZE USEFUL PROGRESS
+
+Choose each action to advance the task or resolve a specific uncertainty
+that is currently preventing progress.
+
+Do not continue exploratory or tiny corrective movements after they
+stop providing useful information. If recent actions produce neither
+task progress nor informative feedback, revise the relevant assumption
+or choose a meaningfully different action.
+
+Task-relevant physical interaction may be necessary. Caution should
+support completing the task, not indefinitely postpone interaction
+once the available evidence supports it.
+
+Use the remaining budget efficiently, without making an unsupported
+large movement merely because few actions remain.
+The evaluator does not insert intermediate actions or task-specific
+skills for you.
+
+INPUT AND OUTPUT BOUNDARIES
+
+Use only the task instruction, provided images, measured robot state,
+your previous control outputs, and supplied execution feedback.
+Do not use tools, inspect files, consult demonstrations, or access
+external information.
+
+Return only the action JSON required by the output schema.
+Do not add explanations, plans, or extra fields.
+
+CURRENT EPISODE
+
+TASK INSTRUCTION: {task_instruction}
+Current step: {step_id}
+Remaining target-action budget: {remaining_budget}
+Current observation ID: {observation_id}
+
+Measured EEF position, meters: {current_position}
+Measured EEF quaternion, XYZW: {current_quaternion}
+Measured gripper state: {current_gripper_state}
+
+The four attached images are the CURRENT observation, in this order:
+1. front
+2. left_shoulder
+3. right_shoulder
+4. wrist"""
+
+GENERAL_CLOSED_LOOP_V1_FOLLOWUP_TEMPLATE = """Continue the same task episode.
+
+TASK INSTRUCTION: {task_instruction}
+Current step: {step_id}
+Remaining target-action budget: {remaining_budget}
+
+MEASURED FEEDBACK FOR PREVIOUS ACTION
+{previous_execution_feedback}
+
+CURRENT OBSERVATION
+Observation ID: {observation_id}
+Measured EEF position, meters: {current_position}
+Measured EEF quaternion, XYZW: {current_quaternion}
+Measured gripper state: {current_gripper_state}
+
+The four newly attached images are the CURRENT:
+1. front
+2. left_shoulder
+3. right_shoulder
+4. wrist
+
+Update your understanding from the measured outcome and current images.
+Choose an action that advances the task or resolves uncertainty that
+is blocking progress.
+
+Keep motion small when uncertain; make more direct progress when
+supported by evidence. Do not repeat unproductive adjustments without
+a reason grounded in new observations.
+
+Return exactly one next absolute target in the required action schema."""
+
+APPLICATION_DEVELOPER_INSTRUCTIONS = (
+    "You are a controller for one RLBench robot task episode. Follow only "
+    "the control instructions and observations supplied in this thread. "
+    "Do not use tools, inspect files, or access external information. "
+    "Return only the requested structured action."
+)
+
 
 class CodexAstraPolicyError(InvalidPolicyOutput):
     """Backward-compatible name for invalid Codex policy output."""
@@ -71,6 +239,7 @@ class CodexAstraPolicy(AstraPolicy):
         timeout: float = 180.0,
         work_root: Optional[str] = None,
         collision_mode: str = "fixed0",
+        motion_prompt_profile: str = "adaptive_small_steps",
     ):
         if not model:
             raise ValueError("Codex model must be non-empty")
@@ -84,6 +253,14 @@ class CodexAstraPolicy(AstraPolicy):
         if collision_mode not in ("fixed0", "fixed1", "predict"):
             raise ValueError("collision_mode must be fixed0, fixed1, or predict")
         self.collision_mode = collision_mode
+        if motion_prompt_profile not in (
+                "adaptive_small_steps", "general_closed_loop_v1"):
+            raise ValueError(
+                "motion_prompt_profile must be adaptive_small_steps or "
+                "general_closed_loop_v1"
+            )
+        self.motion_prompt_profile = motion_prompt_profile
+        self._developer_instructions = APPLICATION_DEVELOPER_INSTRUCTIONS
         self.timeout = float(timeout)
         if work_root is None:
             raise ValueError(
@@ -114,6 +291,36 @@ class CodexAstraPolicy(AstraPolicy):
         self._transient_final_text = None
         self.codex_cli_version_probe_invocation_count = 0
         self.codex_cli_version = self._read_cli_version()
+
+    @staticmethod
+    def prompt_profile_metadata(profile):
+        if profile not in ("adaptive_small_steps", "general_closed_loop_v1"):
+            raise ValueError("unsupported motion prompt profile")
+        templates = (
+            {
+                "first_turn": GENERAL_CLOSED_LOOP_V1_INITIAL_TEMPLATE,
+                "followup_turn": GENERAL_CLOSED_LOOP_V1_FOLLOWUP_TEMPLATE,
+            }
+            if profile == "general_closed_loop_v1" else {}
+        )
+        return {
+            "motion_prompt_profile": profile,
+            "prompt_template_version": profile,
+            "prompt_template_sha256": {
+                name: hashlib.sha256(text.encode("utf-8")).hexdigest()
+                for name, text in templates.items()
+            },
+        }
+
+    def prompt_artifact_metadata(self):
+        developer_bytes = self._developer_instructions.encode("utf-8")
+        return {
+            **self.prompt_profile_metadata(self.motion_prompt_profile),
+            "application_developer_instructions": self._developer_instructions,
+            "application_developer_instructions_sha256": hashlib.sha256(
+                developer_bytes
+            ).hexdigest(),
+        }
 
     def _read_cli_version(self):
         codex = shutil.which("codex")
@@ -209,6 +416,7 @@ class CodexAstraPolicy(AstraPolicy):
                 if self._session is not None else None
             ),
             "reasoning_effort": self.reasoning_effort,
+            **self.prompt_artifact_metadata(),
             "created_at": self._session_started_at,
             "initialization_latency_seconds": (
                 self._session.initialization_latency_seconds
@@ -670,6 +878,33 @@ class CodexAstraPolicy(AstraPolicy):
         remaining = max(0, int(identity.get("waypoint_budget") or 25)
                         - int(step_id))
         observation_id = self._observation_id(step_id)
+        if self.motion_prompt_profile == "general_closed_loop_v1":
+            values = {
+                "task_instruction": instruction,
+                "step_id": int(step_id),
+                "remaining_budget": remaining,
+                "observation_id": observation_id,
+                "current_position": json.dumps(pose[:3]),
+                "current_quaternion": json.dumps(pose[3:7]),
+                "current_gripper_state": gripper_text,
+                "collision_mode_instructions": self._collision_prompt(
+                    profile="general_closed_loop_v1"
+                ),
+            }
+            if int(step_id) == 0:
+                template = GENERAL_CLOSED_LOOP_V1_INITIAL_TEMPLATE
+            else:
+                if self._pending_feedback is None:
+                    raise ModelServiceError(
+                        "a later control turn has no completed-action feedback",
+                        error_code="missing_execution_feedback",
+                    )
+                values["previous_execution_feedback"] = json.dumps(
+                    self._pending_feedback, ensure_ascii=False, allow_nan=False
+                )
+                template = GENERAL_CLOSED_LOOP_V1_FOLLOWUP_TEMPLATE
+            return template.format_map(values)
+
         camera_lines = "\n".join(
             f"- {camera}: observation_id={observation_id}"
             for camera in self.IMAGE_FIELDS
@@ -832,7 +1067,20 @@ class CodexAstraPolicy(AstraPolicy):
         CodexAstraPolicy._write_json(destination, evidence)
         return evidence
 
-    def _collision_prompt(self):
+    def _collision_prompt(self, profile=None):
+        if profile == "general_closed_loop_v1":
+            if self.collision_mode == "predict":
+                return (
+                    "Collision mode is predict. Include ignore_collisions as an "
+                    "integer: 0 keeps collision checking enabled; 1 asks the "
+                    "existing planner to ignore collisions."
+                )
+            fixed_value = 0 if self.collision_mode == "fixed0" else 1
+            return (
+                f"Collision mode is {self.collision_mode}. The evaluator supplies "
+                f"ignore_collisions = {fixed_value} to the existing planner. Do not "
+                "include an ignore_collisions field in your output."
+            )
         if self.collision_mode == "predict":
             return (
                 "Also output ignore_collisions as an integer: 0 keeps collision "
@@ -979,6 +1227,17 @@ class CodexAstraPolicy(AstraPolicy):
             image_paths[camera] = str(image_path)
 
         prompt = self._make_prompt(observation, pose, step_id)
+        prompt_provenance = self.prompt_profile_metadata(
+            self.motion_prompt_profile
+        )
+        prompt_provenance["prompt_sha256"] = hashlib.sha256(
+            prompt.encode("utf-8")
+        ).hexdigest()
+        prompt_provenance["application_developer_instructions_sha256"] = hashlib.sha256(
+            self._developer_instructions.encode("utf-8")
+        ).hexdigest()
+        if self._active_metadata is not None:
+            self._active_metadata.update(prompt_provenance)
         prompt_path = step_dir / "prompt.txt"
         schema_path = step_dir / "action_schema.json"
         accepted_action_path = step_dir / "accepted_action.json"
@@ -1060,13 +1319,9 @@ class CodexAstraPolicy(AstraPolicy):
                 codex, cwd_path, self.model, self.reasoning_effort, self.timeout,
             )
             self._session_started_at = datetime.now(timezone.utc).isoformat()
-            developer_instructions = (
-                "You are a controller for one RLBench robot task episode. Follow only "
-                "the control instructions and observations supplied in this thread. "
-                "Do not use tools, inspect files, or access external information. "
-                "Return only the requested structured action."
+            thread_identity = self._session.create_thread(
+                self._developer_instructions
             )
-            thread_identity = self._session.create_thread(developer_instructions)
             metadata.update({
                 "thread_id": thread_identity["thread_id"],
                 "control_session_id": thread_identity["session_id"],
@@ -1113,6 +1368,8 @@ class CodexAstraPolicy(AstraPolicy):
                 for camera in self.IMAGE_FIELDS
             ],
             "output_schema": self._schema_for_mode(self.collision_mode),
+            "motion_prompt_profile": self.motion_prompt_profile,
+            **prompt_provenance,
             "status": "submitted",
         }
         self._append_control_record(request)

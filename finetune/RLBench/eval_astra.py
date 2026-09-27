@@ -100,7 +100,7 @@ def _build_parser():
     parser.add_argument("--session-mode", choices=("episode",), default="episode",
                         help="native Codex control thread lifetime (one thread per episode)")
     parser.add_argument("--motion-prompt-profile",
-                        choices=("adaptive_small_steps",),
+                        choices=("adaptive_small_steps", "general_closed_loop_v1"),
                         default="adaptive_small_steps",
                         help="prompt-only movement-size guidance")
     parser.add_argument("--recording-width", type=int, default=1280,
@@ -637,6 +637,7 @@ def run_eval(args):
             task_classes.append(task_file_to_task_class(task_name))
 
         manual_action = _parse_manual_action(args.manual_action)
+        prompt_artifact_metadata = {}
         if args.policy == "codex":
             policy = CodexAstraPolicy(
                 model=args.codex_model,
@@ -644,7 +645,10 @@ def run_eval(args):
                 timeout=args.codex_timeout,
                 work_root=policy_work_dir,
                 collision_mode=args.collision_mode,
+                motion_prompt_profile=args.motion_prompt_profile,
             )
+            prompt_artifact_metadata = policy.prompt_artifact_metadata()
+            manifest["prompt_artifact_metadata"] = prompt_artifact_metadata
             manifest["codex_cli_version"] = policy.codex_cli_version
             manifest["codex_cli_version_probe_invocation_count"] = (
                 policy.codex_cli_version_probe_invocation_count
@@ -745,6 +749,17 @@ def run_eval(args):
                                 "session_scope": args.session_mode if args.policy == "codex" else None,
                                 "motion_guidance": "prompt_only" if args.policy == "codex" else None,
                                 "motion_prompt_profile": args.motion_prompt_profile if args.policy == "codex" else None,
+                                "prompt_template_version": prompt_artifact_metadata.get(
+                                    "prompt_template_version"
+                                ),
+                                "prompt_template_sha256": prompt_artifact_metadata.get(
+                                    "prompt_template_sha256"
+                                ),
+                                "application_developer_instructions_sha256": (
+                                    prompt_artifact_metadata.get(
+                                        "application_developer_instructions_sha256"
+                                    )
+                                ),
                                 "programmatic_motion_limiter_added": False,
                                 "policy_input_resolution": [IMAGE_SIZE, IMAGE_SIZE],
                                 "recording_source_resolution": [args.recording_width, args.recording_height],
@@ -1149,6 +1164,18 @@ def run_eval(args):
                             "redundant_record_errors": list(recorder.redundant_record_errors),
                             "core_records_complete": True,
                             "output_directory": str(recorder.run_dir),
+                            "motion_prompt_profile": args.motion_prompt_profile if args.policy == "codex" else None,
+                            "prompt_template_version": prompt_artifact_metadata.get(
+                                "prompt_template_version"
+                            ),
+                            "prompt_template_sha256": prompt_artifact_metadata.get(
+                                "prompt_template_sha256"
+                            ),
+                            "application_developer_instructions_sha256": (
+                                prompt_artifact_metadata.get(
+                                    "application_developer_instructions_sha256"
+                                )
+                            ),
                         }
                         summary = {
                             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1166,7 +1193,6 @@ def run_eval(args):
                             "application_replays_full_history": False,
                             "session_scope": args.session_mode if args.policy == "codex" else None,
                             "motion_guidance": "prompt_only" if args.policy == "codex" else None,
-                            "motion_prompt_profile": args.motion_prompt_profile if args.policy == "codex" else None,
                             "programmatic_motion_limiter_added": False,
                             "policy_input_resolution": [IMAGE_SIZE, IMAGE_SIZE],
                             "recording_source_resolution": [args.recording_width, args.recording_height],

@@ -182,6 +182,16 @@ splitting, retry, or forced gripper rule was added. Codex may use tools despite
 the prompt; the app rejects a reported tool event, but post-hoc event checking
 is not a hardened security boundary.
 
+The default `adaptive_small_steps` prompt remains available for existing
+evaluations. `--motion-prompt-profile general_closed_loop_v1` selects the
+task-agnostic initial and follow-up control messages. Its fixed rules do not
+contain task-specific manipulation steps; the task instruction and measured
+state are supplied by each observation. Run and session artifacts record the
+profile, initial/follow-up template SHA-256 values, the application-provided
+developer instructions, and each actual prompt plus its SHA-256. This profile
+does not change the observation, action, session, planner, or recording
+interfaces.
+
 ## Failure classes, denominators, and timing
 
 Each episode records planned/attempted/evaluable status, successes, failure
